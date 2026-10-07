@@ -1,0 +1,51 @@
+# Bridge — мост между Telegram, MAX и VK
+# Скопируй в config.yaml и заполни своими значениями.
+# Переменные окружения подставляются через ${VAR}.
+
+log:
+  level: info      # debug | info | warn | error
+  format: text     # text | json
+
+storage:
+  path: ./data/bridge.db
+
+adapters:
+  # Telegram (userbot, MTProto).
+  # api_id и api_hash получи на https://my.telegram.org
+  # session_name — имя сессии в БД, чтобы можно было несколько аккаунтов.
+  # Авторизация: bridge-auth -api-id=N -api-hash=HASH -phone=+7...
+  telegram_main:
+    type: telegram
+    api_id: 12345
+    api_hash: "${TG_API_HASH}"
+    session_name: telegram_main
+
+  # MAX (бот). Токен получи у @MasterBot в MAX.
+  # Бот должен быть добавлен админом в целевой канал.
+  max_main:
+    type: max
+    token: "${MAX_TOKEN}"
+
+  # VK (бот сообщества). Токен получи в настройках сообщества.
+  vk_main:
+    type: vk
+    token: "${VK_TOKEN}"
+
+routes:
+  # Один маршрут = один источник + список целей.
+  # Формат chat: "platform:kind:id"
+  #   platform: telegram | max | vk
+  #   kind:     user | group | channel
+  #   id:       числовой ID чата
+  - id: main-mirror
+    from_adapter: telegram_main
+    from_chat: "telegram:channel:-1001234567890"
+    targets:
+      - adapter: max_main
+        chat: "max:channel:42"
+      - adapter: vk_main
+        chat: "vk:group:2000000001"
+    options:
+      forward_attachments: true
+      forward_reply: true
+      only_text: false
