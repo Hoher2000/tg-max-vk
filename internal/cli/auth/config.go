@@ -12,6 +12,10 @@ type Config struct {
 	Phone       string
 	DBPath      string
 	SessionName string
+
+	// Verify — если true, bridge-auth проверяет сессию через сеть,
+	// даже если она есть в БД. По умолчанию — false (быстрый выход).
+	Verify bool
 }
 
 // Validate проверяет, что все обязательные поля заполнены.

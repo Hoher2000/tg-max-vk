@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
+	"path/filepath"
 
 	"github.com/Hoher2000/tg-max-vk/internal/adapters/max"
 	"github.com/Hoher2000/tg-max-vk/internal/adapters/telegram"
@@ -58,9 +58,10 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 func openDB(ctx context.Context, path string, log *slog.Logger) (*sql.DB, error) {
 	// Создаём директорию, если её нет.
-	if idx := strings.LastIndexByte(path, '/'); idx > 0 {
-		if err := os.MkdirAll(path[:idx], 0o755); err != nil {
-			return nil, fmt.Errorf("create data dir: %w", err)
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create data dir %q: %w", dir, err)
 		}
 	}
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -75,8 +76,11 @@ func (a *Adapter) Start(ctx context.Context, out chan<- *domain.Message) error {
 		a.mu.Unlock()
 	}()
 
+	a.log.Info("telegram adapter starting", "session", a.sessionName)
+
 	dispatcher := tg.NewUpdateDispatcher()
 	dispatcher.OnNewMessage(a.onNewMessage(out))
+	dispatcher.OnNewChannelMessage(a.onNewChannelMessage(out))
 
 	a.client = telegram.NewClient(a.apiID, a.apiHash, telegram.Options{
 		SessionStorage: newSessionStorage(a.db, a.sessionName),
@@ -84,16 +88,18 @@ func (a *Adapter) Start(ctx context.Context, out chan<- *domain.Message) error {
 	})
 
 	errCh := make(chan error, 1)
+	readyCh := make(chan struct{})
 
 	go func() {
 		errCh <- a.client.Run(ctx, func(runCtx context.Context) error {
+			a.log.Info("telegram: checking auth status")
 			status, err := a.client.Auth().Status(runCtx)
 			if err != nil {
 				return fmt.Errorf("auth status: %w", err)
 			}
 			if !status.Authorized {
 				return fmt.Errorf(
-					"telegram session %q is not authorized; run `bridge auth telegram` first",
+					"telegram session %q is not authorized; run `tg-max-vk-auth` first",
 					a.sessionName,
 				)
 			}
@@ -106,20 +112,41 @@ func (a *Adapter) Start(ctx context.Context, out chan<- *domain.Message) error {
 				"user_id", status.User.ID,
 			)
 
+			close(readyCh)
+
 			<-runCtx.Done()
 			return nil
 		})
 	}()
 
+	// Ждём либо готовности, либо ошибки, либо отмены.
 	select {
 	case <-ctx.Done():
-		a.log.Info("telegram adapter stopping")
+		a.log.Info("telegram adapter stopping (context cancelled)")
 		return nil
 	case err := <-errCh:
 		if err != nil {
 			a.log.Error("telegram client failed", "err", err)
 		}
 		return err
+	case <-readyCh:
+		// Успешно подключились — ждём отмены ctx или ошибки.
+		a.log.Info("telegram adapter running")
+		select {
+		case <-ctx.Done():
+			a.log.Info("telegram adapter stopping")
+			return nil
+		case err := <-errCh:
+			if err != nil {
+				a.log.Error("telegram client failed", "err", err)
+			}
+			return err
+		}
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf(
+			"telegram connection timeout after 30s; " +
+				"проверь VPN/TUN/прокси (TG_PROXY) или доступность api.telegram.org",
+		)
 	}
 }
 
@@ -164,6 +191,71 @@ func (a *Adapter) onNewMessage(out chan<- *domain.Message) tg.NewMessageHandler 
 		}
 
 		// Reply header.
+		if hdr, ok := msg.ReplyTo.(*tg.MessageReplyHeader); ok {
+			coreMsg.ReplyTo = &domain.MessageRef{
+				Chat: chatID,
+				ID:   strconv.Itoa(hdr.ReplyToMsgID),
+			}
+		}
+
+		a.log.Debug("personal message received",
+			"chat", chatID.String(),
+			"msg_id", msg.ID,
+			"text", msg.Message,
+		)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case out <- coreMsg:
+		}
+		return nil
+	}
+}
+
+// onNewChannelMessage возвращает обработчик апдейтов из каналов.
+// Сообщения из каналов приходят как UpdateNewChannelMessage —
+// это отдельный тип, и его надо слушать отдельно.
+func (a *Adapter) onNewChannelMessage(out chan<- *domain.Message) tg.NewChannelMessageHandler {
+	return func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
+		msg, ok := u.Message.(*tg.Message)
+		if !ok {
+			return nil
+		}
+
+		// Обновляем кэш access_hash каналов.
+		a.channelsMu.Lock()
+		for _, ch := range e.Channels {
+			if !ch.Min {
+				a.channels[ch.ID] = ch.AccessHash
+			}
+		}
+		a.channelsMu.Unlock()
+
+		chatID, err := chatIDFromPeer(msg.PeerID)
+		if err != nil {
+			a.log.Warn("cannot resolve peer", "err", err)
+			return nil
+		}
+
+		a.log.Debug("channel message received",
+			"chat", chatID.String(),
+			"msg_id", msg.ID,
+			"text", msg.Message,
+		)
+
+		coreMsg := &domain.Message{
+			Ref: domain.MessageRef{
+				Chat: chatID,
+				ID:   strconv.Itoa(msg.ID),
+			},
+			AdapterName: a.name,
+			SenderID:    senderIDFromPeer(msg.FromID),
+			Text:        msg.Message,
+			Timestamp:   time.Unix(int64(msg.Date), 0),
+			Meta:        make(map[string]any),
+		}
+
 		if hdr, ok := msg.ReplyTo.(*tg.MessageReplyHeader); ok {
 			coreMsg.ReplyTo = &domain.MessageRef{
 				Chat: chatID,
@@ -217,27 +309,64 @@ func (a *Adapter) resolveInputPeer(ctx context.Context, chat domain.ChatID) (tg.
 	if chat.Platform() != domain.PlatformTelegram {
 		return nil, fmt.Errorf("not a telegram chat: %s", chat)
 	}
-	id, err := strconv.ParseInt(chat.ID(), 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid telegram chat id %q: %w", chat.ID(), err)
-	}
+
+	rawID := chat.ID()
 
 	switch chat.Kind() {
 	case domain.ChatKindUser:
+		id, err := strconv.ParseInt(rawID, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid user id %q: %w", rawID, err)
+		}
 		return &tg.InputPeerUser{UserID: id}, nil
+
 	case domain.ChatKindGroup:
+		id, err := strconv.ParseInt(rawID, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid group id %q: %w", rawID, err)
+		}
 		return &tg.InputPeerChat{ChatID: id}, nil
+
 	case domain.ChatKindChannel:
+		// 1. Если это юзернейм (начинается с @) — резолвим через API
+		if strings.HasPrefix(rawID, "@") {
+			username := strings.TrimPrefix(rawID, "@")
+			req := &tg.ContactsResolveUsernameRequest{
+				Username: username,
+			}
+			res, err := a.api.ContactsResolveUsername(ctx, req)
+			if err != nil {
+				return nil, fmt.Errorf("resolve username @%s: %w", username, err)
+			}
+
+			for _, c := range res.Chats {
+				if ch, ok := c.(*tg.Channel); ok {
+					a.channelsMu.Lock()
+					a.channels[ch.ID] = ch.AccessHash
+					a.channelsMu.Unlock()
+					return &tg.InputPeerChannel{ChannelID: ch.ID, AccessHash: ch.AccessHash}, nil
+				}
+			}
+			return nil, fmt.Errorf("@%s is not a channel", username)
+		}
+
+		// 2. Если это числовой ID — ищем в кэше
+		id, err := strconv.ParseInt(rawID, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid channel id %q: %w", rawID, err)
+		}
+		channelID, err := peerIDToChannelID(id)
+		if err != nil {
+			return nil, fmt.Errorf("parse channel id %q: %w", chat.ID(), err)
+		}
 		a.channelsMu.RLock()
-		hash, ok := a.channels[id]
+		hash, ok := a.channels[channelID]
 		a.channelsMu.RUnlock()
 		if !ok {
-			return nil, fmt.Errorf(
-				"no access_hash for channel %d; wait for an update from it or use @username",
-				id,
-			)
+			return nil, fmt.Errorf("no access_hash for channel %d; wait for an update or use @username", channelID)
 		}
-		return &tg.InputPeerChannel{ChannelID: id, AccessHash: hash}, nil
+		return &tg.InputPeerChannel{ChannelID: channelID, AccessHash: hash}, nil
+
 	default:
 		return nil, fmt.Errorf("unknown chat kind %q", chat.Kind())
 	}

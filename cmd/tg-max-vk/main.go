@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 
 	"github.com/Hoher2000/tg-max-vk/internal/app"
@@ -16,6 +18,11 @@ import (
 var version = "dev"
 
 func main() {
+	_ = godotenv.Load(".env", ".env.local")
+
+	fmt.Fprintln(os.Stderr, "DEBUG: LOG_LEVEL =", os.Getenv("LOG_LEVEL"))
+	fmt.Fprintln(os.Stderr, "DEBUG: TG_API_ID =", os.Getenv("TG_API_ID"))
+
 	root := &cobra.Command{
 		Use:   "bridge",
 		Short: "Bridge — мост между Telegram, MAX и VK",

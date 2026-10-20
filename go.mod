@@ -4,6 +4,7 @@ go 1.27.1
 
 require (
 	github.com/gotd/td v0.162.0
+	github.com/joho/godotenv v1.5.1
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/sync v0.23.0
 	golang.org/x/time v0.14.0
