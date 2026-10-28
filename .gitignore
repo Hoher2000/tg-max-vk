@@ -5,3 +5,15 @@ data/
 *.db
 *.db-shm
 *.db-wal
+
+# Air (hot reload)
+tmp/
+build-errors.log
+
+# Makefile build artifacts
+bin/
+
+# Go build artifacts
+*.exe
+*.test
+*.out
