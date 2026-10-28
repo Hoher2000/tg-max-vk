@@ -221,6 +221,7 @@ func (r *Router) prepareOutgoing(ctx context.Context, msg *domain.Message, targe
 	}
 
 	// Скачиваем медиа, если пришло по URL (например, из MAX)
+	// Скачиваем медиа, если пришло по URL (например, из MAX)
 	for i := range out.Attachments {
 		if out.Attachments[i].MediaKey == "" && out.Attachments[i].URL != "" {
 			key, err := r.media.Fetch(ctx, out.Attachments[i])
@@ -230,7 +231,7 @@ func (r *Router) prepareOutgoing(ctx context.Context, msg *domain.Message, targe
 			}
 			out.Attachments[i].MediaKey = key
 
-			// ВОССТАНАВЛИВАЕМ ИМЯ ФАЙЛА ИЗ КЛЮЧА (формат ключа: "timestamp_filename.ext")
+			// Восстанавливаем имя файла из ключа (формат: "timestamp_filename.ext")
 			if out.Attachments[i].FileName == "" || out.Attachments[i].FileName == "file" {
 				parts := strings.SplitN(key, "_", 2)
 				if len(parts) == 2 {

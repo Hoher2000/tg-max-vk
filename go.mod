@@ -3,6 +3,7 @@ module github.com/Hoher2000/tg-max-vk
 go 1.27.1
 
 require (
+	github.com/gabriel-vasile/mimetype v1.4.16
 	github.com/gotd/td v0.162.0
 	github.com/joho/godotenv v1.5.1
 	github.com/spf13/cobra v1.10.2

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Hoher2000/tg-max-vk/internal/domain"
+	"github.com/gabriel-vasile/mimetype"
 )
 
 type LocalStore struct {
@@ -45,46 +46,51 @@ func (s *LocalStore) Fetch(ctx context.Context, att domain.Attachment) (string, 
 		return "", fmt.Errorf("download failed: status %d", resp.StatusCode)
 	}
 
-	// 1. Читаем первые 512 байт для определения типа (магия файлов)
+	// 1. Читаем первые 512 байт для определения типа
 	buffer := make([]byte, 512)
 	n, _ := io.ReadFull(resp.Body, buffer)
-
-	// http.DetectContentType понимает PDF, ZIP (в т.ч. DOCX/XLSX), картинки и т.д.
-	detectedMime := http.DetectContentType(buffer[:n])
-
-	// Возвращаем считанные байты обратно в поток
 	reader := io.MultiReader(bytes.NewReader(buffer[:n]), resp.Body)
 
-	// 2. Определяем расширение
+	// 2. Определяем MIME-тип с помощью mimetype
+	mimeType := http.DetectContentType(buffer[:n])
+	if mt := mimetype.Detect(buffer[:n]); mt != nil {
+		mimeType = mt.String()
+	}
+
+	// 3. Определяем расширение по MIME
 	ext := ""
 	switch {
-	case strings.Contains(detectedMime, "application/pdf"):
+	case strings.Contains(mimeType, "application/pdf"):
 		ext = ".pdf"
-	case strings.Contains(detectedMime, "application/zip"): // DOCX/XLSX это zip
-		ext = ".zip" // Поставим zip, если MAX не передал точное имя
-	case strings.Contains(detectedMime, "image/jpeg"):
+	case strings.Contains(mimeType, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"):
+		ext = ".xlsx"
+	case strings.Contains(mimeType, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
+		ext = ".docx"
+	case strings.Contains(mimeType, "application/zip"):
+		ext = ".zip"
+	case strings.Contains(mimeType, "image/jpeg"):
 		ext = ".jpg"
-	case strings.Contains(detectedMime, "image/png"):
+	case strings.Contains(mimeType, "image/png"):
 		ext = ".png"
-	case strings.Contains(detectedMime, "image/webp"):
+	case strings.Contains(mimeType, "image/webp"):
 		ext = ".webp"
-	case strings.Contains(detectedMime, "video/mp4"):
+	case strings.Contains(mimeType, "video/mp4"):
 		ext = ".mp4"
 	}
 
-	// 3. Формируем имя файла
+	// 4. Формируем имя файла
 	filename := att.FileName
 	if filename == "" || filename == "file" || filename == "getfile" || filename == "downloaded_file" {
 		filename = "document"
 	}
 
-	// Очищаем от мусора
+	// Очищаем от параметров URL
 	if idx := strings.IndexByte(filename, '?'); idx != -1 {
 		filename = filename[:idx]
 	}
 	filename = filepath.Base(filename)
 
-	// Если в имени нет точки — добавляем найденное расширение
+	// Добавляем расширение, если его нет
 	if !strings.Contains(filename, ".") && ext != "" {
 		filename += ext
 	} else if !strings.Contains(filename, ".") && ext == "" {
