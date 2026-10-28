@@ -1,0 +1,15 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/main ./cmd/tg-max-vk"
+  bin = "./tmp/main"
+  full_bin = "./tmp/main run -c config/config.yaml"
+  include_ext = ["go", "yaml", "html", "sql"]
+  exclude_dir = ["assets", "tmp", "vendor", "data", ".git"]
+  exclude_regex = ["_test.go"]
+  delay = 1000
+  stop_on_error = true
+  send_interrupt = false
+  kill_delay = "0s"
+  log = "build-errors.log"
