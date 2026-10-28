@@ -17,10 +17,11 @@ const (
 // Attachment — вложение сообщения.
 type Attachment struct {
 	Type     AttachmentType
-	URL      string // временный URL для скачивания (протухает)
-	FileID   string // постоянный ID внутри платформы (если есть)
+	MediaKey string
+	URL      string // Для HTTP-скачивания (MAX)
+	FileID   string // Для Telegram
+	FileSize int64
 	FileName string
-	Size     int64
 	MimeType string
 }
 

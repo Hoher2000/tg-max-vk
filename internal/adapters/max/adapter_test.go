@@ -15,7 +15,8 @@ import (
 func newTestAdapter(t *testing.T, serverURL string) *Adapter {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	a := New(Config{Name: "max_test", Token: "test-token"}, log)
+	// Передаем nil вместо MediaStore, так как тесты не проверяют работу с файлами.
+	a := New(Config{Name: "max_test", Token: "test-token"}, nil, log)
 	a.client.baseURL = serverURL
 	return a
 }

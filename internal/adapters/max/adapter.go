@@ -15,6 +15,7 @@ import (
 type Adapter struct {
 	name   string
 	token  string
+	media  domain.MediaStore
 	client *Client
 	log    *slog.Logger
 
@@ -31,10 +32,11 @@ type Config struct {
 	Token string
 }
 
-func New(cfg Config, log *slog.Logger) *Adapter {
+func New(cfg Config, media domain.MediaStore, log *slog.Logger) *Adapter {
 	return &Adapter{
 		name:   cfg.Name,
 		token:  cfg.Token,
+		media:  media,
 		client: NewClient(cfg.Token),
 		log:    log.With("adapter", cfg.Name),
 	}
@@ -126,7 +128,7 @@ func (a *Adapter) convertUpdate(u Update) *domain.Message {
 		return nil
 	}
 
-	// Определяем чат и вид.
+	// Определяем чат и вид
 	var chatKind domain.ChatKind
 	var chatID int64
 
@@ -158,6 +160,7 @@ func (a *Adapter) convertUpdate(u Update) *domain.Message {
 		return nil
 	}
 
+	// Сначала создаем само сообщение!
 	out := &domain.Message{
 		Ref: domain.MessageRef{
 			Chat: chat,
@@ -167,6 +170,33 @@ func (a *Adapter) convertUpdate(u Update) *domain.Message {
 		Text:        msg.Body.Text,
 		Timestamp:   time.UnixMilli(msg.Timestamp),
 		Meta:        make(map[string]any),
+	}
+
+	// ТЕПЕРЬ парсим вложения и добавляем их в out.Attachments
+	for _, att := range msg.Body.Attachments {
+		attType := domain.AttachmentDocument
+		if att.Type == "image" {
+			attType = domain.AttachmentPhoto
+		} else if att.Type == "video" {
+			attType = domain.AttachmentVideo
+		}
+
+		// Извлекаем URL из payload
+		var fileURL string
+		if payloadMap, ok := att.Payload.(map[string]any); ok {
+			if u, ok := payloadMap["url"].(string); ok {
+				fileURL = u
+			}
+		}
+
+		if fileURL != "" {
+			out.Attachments = append(out.Attachments, domain.Attachment{
+				Type: attType,
+				URL:  fileURL,
+			})
+		} else {
+			a.log.Debug("attachment without URL", "type", att.Type)
+		}
 	}
 
 	if msg.Sender != nil {
@@ -195,8 +225,11 @@ func (a *Adapter) Send(ctx context.Context, msg *domain.Message) (domain.Message
 		return domain.MessageRef{}, err
 	}
 
+	attachments := a.prepareAttachments(ctx, msg)
+
 	sent, err := a.client.sendMessage(ctx, chatID, userID, SendMessageRequest{
-		Text: msg.Text,
+		Text:        msg.Text,
+		Attachments: attachments,
 	})
 	if err != nil {
 		return domain.MessageRef{}, fmt.Errorf("max send: %w", err)
@@ -215,7 +248,20 @@ func (a *Adapter) Reply(ctx context.Context, to domain.MessageRef, msg *domain.M
 		return domain.MessageRef{}, err
 	}
 
-	sent, err := a.client.replyToMessage(ctx, chatID, userID, msg.Text, to.ID)
+	attachments := a.prepareAttachments(ctx, msg)
+
+	// Формируем запрос с привязкой к сообщению (Reply)
+	body := SendMessageRequest{
+		Text:        msg.Text,
+		Attachments: attachments,
+		Link: &LinkedMessage{
+			Type: "reply",
+			Body: &MessageBody{Mid: to.ID},
+		},
+	}
+
+	// Вызываем обычный sendMessage, так как API MAX универсально
+	sent, err := a.client.sendMessage(ctx, chatID, userID, body)
 	if err != nil {
 		return domain.MessageRef{}, fmt.Errorf("max reply: %w", err)
 	}
@@ -244,4 +290,41 @@ func parseTargetChat(chat domain.ChatID) (chatID, userID int64, err error) {
 	default:
 		return 0, 0, fmt.Errorf("unknown chat kind %q", chat.Kind())
 	}
+}
+
+// prepareAttachments загружает файлы в MAX и возвращает готовые объекты для API
+func (a *Adapter) prepareAttachments(ctx context.Context, msg *domain.Message) []Attachment {
+	var attachments []Attachment
+	for _, att := range msg.Attachments {
+		if att.MediaKey == "" {
+			continue
+		}
+
+		file, err := a.media.Open(ctx, att.MediaKey)
+		if err != nil {
+			a.log.Error("failed to open media", "key", att.MediaKey, "err", err)
+			continue
+		}
+
+		token, err := a.client.uploadMedia(ctx, att, file)
+		file.Close()
+
+		if err != nil {
+			a.log.Error("failed to upload media to max", "err", err)
+			continue
+		}
+
+		attType := "image"
+		if att.Type == domain.AttachmentVideo {
+			attType = "video"
+		} else if att.Type == domain.AttachmentDocument {
+			attType = "file"
+		}
+
+		attachments = append(attachments, Attachment{
+			Type:    attType,
+			Payload: map[string]any{"token": token},
+		})
+	}
+	return attachments
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/Hoher2000/tg-max-vk/internal/domain"
 	"github.com/Hoher2000/tg-max-vk/internal/ratelimit"
@@ -16,6 +17,7 @@ type Router struct {
 	adapters map[string]domain.Adapter
 	routes   []Route
 	store    domain.Store
+	media    domain.MediaStore
 	limiter  *ratelimit.Manager
 	log      *slog.Logger
 }
@@ -24,6 +26,7 @@ func New(
 	adapters map[string]domain.Adapter,
 	routes []Route,
 	store domain.Store,
+	media domain.MediaStore, // <-- Добавили
 	limiter *ratelimit.Manager,
 	log *slog.Logger,
 ) *Router {
@@ -31,6 +34,7 @@ func New(
 		adapters: adapters,
 		routes:   routes,
 		store:    store,
+		media:    media,
 		limiter:  limiter,
 		log:      log,
 	}
@@ -117,17 +121,34 @@ func (r *Router) forward(ctx context.Context, msg *domain.Message, route Route) 
 
 // deliver пересылает сообщение в одну конкретную цель.
 func (r *Router) deliver(ctx context.Context, msg *domain.Message, route Route, target Target) error {
+	// 1. Получаем адаптер назначения
 	adapter, ok := r.adapters[target.Adapter]
 	if !ok {
 		return fmt.Errorf("adapter %q not registered", target.Adapter)
 	}
 
-	// Ждём, пока можно будет отправить в этот чат.
+	// 2. ЛЕНИВАЯ ЗАГРУЗКА МЕДИА
+	// Если в сообщении есть нескачанные вложения (заглушки),
+	// просим исходный адаптер их скачать.
+	if len(msg.Attachments) > 0 && msg.Attachments[0].Type == "pending" {
+		srcAdapter, ok := r.adapters[msg.AdapterName]
+		if ok {
+			if fetcher, ok := srcAdapter.(domain.MediaFetcher); ok {
+				if err := fetcher.FetchMedia(ctx, msg); err != nil {
+					r.log.Error("failed to fetch media", "err", err)
+					// Если не смогли скачать — шлём хотя бы текст
+					msg.Attachments = nil
+				}
+			}
+		}
+	}
+
+	// 3. Ждём, пока можно будет отправить в этот чат (Rate Limit)
 	if err := r.limiter.Wait(ctx, target.Chat); err != nil {
 		return fmt.Errorf("rate limit wait: %w", err)
 	}
 
-	// Если это reply и есть сохранённый маппинг — отвечаем как reply.
+	// 4. Обрабатываем Reply
 	if msg.ReplyTo != nil && route.Options.ForwardReply {
 		targetRef, err := r.tryReply(ctx, adapter, msg, target)
 		if err == nil {
@@ -139,17 +160,24 @@ func (r *Router) deliver(ctx context.Context, msg *domain.Message, route Route, 
 				"route", route.ID,
 			)
 		}
-		// ErrNotFound — нормальная ситуация: исходное сообщение не пересылалось.
-		// Падаем в обычную отправку ниже.
 	}
 
-	out := r.prepareOutgoing(msg, target)
+	// 5. Готовим сообщение к отправке
+	out := r.prepareOutgoing(ctx, msg, target)
 
+	// 6. Защита от пустых сообщений
+	if out.Text == "" && len(out.Attachments) == 0 {
+		r.log.Debug("skipping empty message", "msg_id", msg.Ref.ID)
+		return nil
+	}
+
+	// 7. Отправляем
 	ref, err := adapter.Send(ctx, out)
 	if err != nil {
 		return fmt.Errorf("send: %w", err)
 	}
 
+	// 8. Сохраняем связь
 	return r.saveLinkAndLog(ctx, msg, ref, route, target)
 }
 
@@ -173,7 +201,7 @@ func (r *Router) tryReply(ctx context.Context, adapter domain.Adapter, msg *doma
 	for _, link := range links {
 		if link.Target.Chat.Equal(targetChat) {
 			// Нашли нужный target — отвечаем на него.
-			out := r.prepareOutgoing(msg, target)
+			out := r.prepareOutgoing(ctx, msg, target)
 			return replier.Reply(ctx, link.Target, out)
 		}
 	}
@@ -183,13 +211,33 @@ func (r *Router) tryReply(ctx context.Context, adapter domain.Adapter, msg *doma
 }
 
 // prepareOutgoing формирует сообщение для отправки в целевую платформу.
-func (r *Router) prepareOutgoing(msg *domain.Message, target Target) *domain.Message {
+func (r *Router) prepareOutgoing(ctx context.Context, msg *domain.Message, target Target) *domain.Message {
 	out := &domain.Message{
 		Ref:         domain.MessageRef{Chat: target.Chat},
 		AdapterName: target.Adapter,
 		Text:        msg.Text,
 		Attachments: msg.Attachments,
 		Timestamp:   msg.Timestamp,
+	}
+
+	// Скачиваем медиа, если пришло по URL (например, из MAX)
+	for i := range out.Attachments {
+		if out.Attachments[i].MediaKey == "" && out.Attachments[i].URL != "" {
+			key, err := r.media.Fetch(ctx, out.Attachments[i])
+			if err != nil {
+				r.log.Error("failed to fetch media from url", "url", out.Attachments[i].URL, "err", err)
+				continue
+			}
+			out.Attachments[i].MediaKey = key
+
+			// ВОССТАНАВЛИВАЕМ ИМЯ ФАЙЛА ИЗ КЛЮЧА (формат ключа: "timestamp_filename.ext")
+			if out.Attachments[i].FileName == "" || out.Attachments[i].FileName == "file" {
+				parts := strings.SplitN(key, "_", 2)
+				if len(parts) == 2 {
+					out.Attachments[i].FileName = parts[1]
+				}
+			}
+		}
 	}
 
 	// Помечаем как созданное мостом — защита от эхо.

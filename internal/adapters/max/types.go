@@ -96,3 +96,16 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 	Details string `json:"details,omitempty"`
 }
+
+type UploadResponse struct {
+	URL   string `json:"url,omitempty"`
+	Token string `json:"token,omitempty"`
+	// Для изображений токен лежит в фото-мапе
+	Photos map[string]struct {
+		Token string `json:"token"`
+	} `json:"photos,omitempty"`
+}
+
+type MediaPayload struct {
+	Token string `json:"token"`
+}

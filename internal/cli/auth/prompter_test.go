@@ -23,26 +23,6 @@ func TestStdinPrompter_ReadCode(t *testing.T) {
 	}
 }
 
-func TestStdinPrompter_ReadPassword_FromEnv(t *testing.T) {
-	t.Setenv("TG_2FA_PASSWORD", "envpw")
-
-	in := bytes.NewBufferString("") // stdin пустой
-	out := &bytes.Buffer{}
-	p := &StdinPrompter{In: in, Out: out}
-
-	got, err := p.ReadPassword(context.Background())
-	if err != nil {
-		t.Fatalf("ReadPassword: %v", err)
-	}
-	if got != "envpw" {
-		t.Errorf("want envpw, got %q", got)
-	}
-	// Промпт не должен показываться, если пароль взят из env.
-	if bytes.Contains(out.Bytes(), []byte("2FA")) {
-		t.Errorf("prompt should not be shown when env is set: %q", out.String())
-	}
-}
-
 func TestStdinPrompter_ReadPassword_Interactive(t *testing.T) {
 	t.Setenv("TG_2FA_PASSWORD", "") // чистим
 

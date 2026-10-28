@@ -12,6 +12,7 @@ import (
 	"github.com/Hoher2000/tg-max-vk/internal/adapters/telegram"
 	"github.com/Hoher2000/tg-max-vk/internal/config"
 	"github.com/Hoher2000/tg-max-vk/internal/domain"
+	"github.com/Hoher2000/tg-max-vk/internal/media"
 	"github.com/Hoher2000/tg-max-vk/internal/ratelimit"
 	"github.com/Hoher2000/tg-max-vk/internal/router"
 	"github.com/Hoher2000/tg-max-vk/internal/storage"
@@ -30,8 +31,14 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	store := storage.NewSQLiteStoreFromDB(db)
 
+	// Создаём хранилище медиа (файлы будут лежать в ./data/media)
+	mediaStore, err := media.NewLocalStore("./data/media")
+	if err != nil {
+		return fmt.Errorf("init media store: %w", err)
+	}
+
 	// 2. Создаём адаптеры.
-	adapters, err := buildAdapters(cfg, db, log)
+	adapters, err := buildAdapters(cfg, db, mediaStore, log)
 	if err != nil {
 		return fmt.Errorf("adapters: %w", err)
 	}
@@ -49,7 +56,7 @@ func Run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	defer limiter.Stop()
 
 	// Router
-	r := router.New(adapters, routes, store, limiter, log)
+	r := router.New(adapters, routes, store, mediaStore, limiter, log)
 	if err := r.Run(ctx); err != nil {
 		return fmt.Errorf("router: %w", err)
 	}
@@ -92,7 +99,7 @@ func openDB(ctx context.Context, path string, log *slog.Logger) (*sql.DB, error)
 	return db, nil
 }
 
-func buildAdapters(cfg *config.Config, db *sql.DB, log *slog.Logger) (map[string]domain.Adapter, error) {
+func buildAdapters(cfg *config.Config, db *sql.DB, mediaStore domain.MediaStore, log *slog.Logger) (map[string]domain.Adapter, error) {
 	adapters := make(map[string]domain.Adapter, len(cfg.Adapters))
 
 	for name, ac := range cfg.Adapters {
@@ -103,13 +110,15 @@ func buildAdapters(cfg *config.Config, db *sql.DB, log *slog.Logger) (map[string
 				APIID:       ac.APIID,
 				APIHash:     ac.APIHash,
 				SessionName: ac.SessionName,
-			}, db, log)
+			}, db, mediaStore, log) // <--- Передаём mediaStore
 			adapters[name] = a
 		case "max":
-			adapters[name] = max.New(max.Config{
+			// Передаем mediaStore вторым аргументом!
+			a := max.New(max.Config{
 				Name:  name,
 				Token: ac.Token,
-			}, log)
+			}, mediaStore, log)
+			adapters[name] = a
 		case "vk":
 			return nil, fmt.Errorf("adapter %q: type %q not implemented yet", name, ac.Type)
 

@@ -96,7 +96,9 @@ func TestChatIDFromPeer(t *testing.T) {
 		},
 		{
 			name: "channel",
-			peer: &tg.PeerChannel{ChannelID: -1001234567890},
+			// В MTProto ChannelID всегда положительный.
+			// Наша функция сама добавит префикс -100.
+			peer: &tg.PeerChannel{ChannelID: 1234567890},
 			want: "telegram:channel:-1001234567890",
 		},
 	}

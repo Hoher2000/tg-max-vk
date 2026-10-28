@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -118,6 +119,30 @@ func (m *mockStore) LookupSource(ctx context.Context, tgt domain.MessageRef) (*d
 
 func (m *mockStore) Close() error { return nil }
 
+// ---------- Mock MediaStore ----------
+
+type mockMediaStore struct{}
+
+func (m *mockMediaStore) Fetch(ctx context.Context, att domain.Attachment) (string, error) {
+	return "mock-key", nil
+}
+
+func (m *mockMediaStore) Open(ctx context.Context, key string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (m *mockMediaStore) Remove(ctx context.Context, key string) error {
+	return nil
+}
+
+func (m *mockMediaStore) GC(ctx context.Context, olderThan time.Duration) error {
+	return nil
+}
+
+func (m *mockMediaStore) Save(ctx context.Context, r io.Reader, filename string) (string, error) {
+	return "mock-key", nil
+}
+
 // ---------- Helpers ----------
 
 // newTestLimiter создаёт rate limiter с очень щедрыми лимитами,
@@ -165,7 +190,10 @@ func newTestRouter(
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	limiter := newTestLimiter(t)
-	return New(adapters, routes, store, limiter, log)
+	media := &mockMediaStore{} // <--- передаём мок
+
+	// Теперь функция New принимает 6 аргументов
+	return New(adapters, routes, store, media, limiter, log)
 }
 
 func mustChat(t *testing.T, p domain.Platform, k domain.ChatKind, id string) domain.ChatID {

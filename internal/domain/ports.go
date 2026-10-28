@@ -60,6 +60,9 @@ type Store interface {
 
 // MediaStore — промежуточное хранилище вложений.
 type MediaStore interface {
+	// Save сохраняет файл из потока и возвращает ключ.
+	Save(ctx context.Context, r io.Reader, filename string) (string, error)
+
 	// Fetch скачивает вложение и возвращает ключ для последующего чтения.
 	Fetch(ctx context.Context, att Attachment) (string, error)
 
@@ -71,4 +74,11 @@ type MediaStore interface {
 
 	// GC удаляет файлы старше TTL.
 	GC(ctx context.Context, olderThan time.Duration) error
+}
+
+// MediaFetcher — опциональный интерфейс для адаптеров, которые умеют
+// скачивать медиа-файлы (например, из Telegram).
+type MediaFetcher interface {
+	// FetchMedia скачивает вложения в MediaStore и обновляет msg.Attachments.
+	FetchMedia(ctx context.Context, msg *Message) error
 }
