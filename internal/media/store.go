@@ -46,39 +46,28 @@ func (s *LocalStore) Fetch(ctx context.Context, att domain.Attachment) (string, 
 		return "", fmt.Errorf("download failed: status %d", resp.StatusCode)
 	}
 
-	// 1. Читаем первые 512 байт для определения типа
-	buffer := make([]byte, 512)
-	n, _ := io.ReadFull(resp.Body, buffer)
-	reader := io.MultiReader(bytes.NewReader(buffer[:n]), resp.Body)
+	// 1. Устанавливаем лимит для mimetype (чтобы заглянуть в конец ZIP-файла)
+	mimetype.SetLimit(1024 * 1024) // 1 МБ
 
-	// 2. Определяем MIME-тип с помощью mimetype
-	mimeType := http.DetectContentType(buffer[:n])
-	if mt := mimetype.Detect(buffer[:n]); mt != nil {
-		mimeType = mt.String()
+	// 2. Буфер для дублирования прочитанных байт
+	var headerBuf bytes.Buffer
+	tee := io.TeeReader(resp.Body, &headerBuf)
+
+	// 3. Определяем MIME-тип по потоку
+	mType, err := mimetype.DetectReader(tee)
+	if err != nil {
+		return "", fmt.Errorf("detect mime: %w", err)
 	}
 
-	// 3. Определяем расширение по MIME
-	ext := ""
-	switch {
-	case strings.Contains(mimeType, "application/pdf"):
-		ext = ".pdf"
-	case strings.Contains(mimeType, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"):
-		ext = ".xlsx"
-	case strings.Contains(mimeType, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
-		ext = ".docx"
-	case strings.Contains(mimeType, "application/zip"):
-		ext = ".zip"
-	case strings.Contains(mimeType, "image/jpeg"):
-		ext = ".jpg"
-	case strings.Contains(mimeType, "image/png"):
-		ext = ".png"
-	case strings.Contains(mimeType, "image/webp"):
-		ext = ".webp"
-	case strings.Contains(mimeType, "video/mp4"):
-		ext = ".mp4"
+	ext := mType.Extension()
+	if ext == "" {
+		ext = ".bin"
 	}
 
-	// 4. Формируем имя файла
+	// 4. Склеиваем прочитанные байты (headerBuf) с остатком (resp.Body)
+	reader := io.MultiReader(&headerBuf, resp.Body)
+
+	// 5. Формируем имя файла
 	filename := att.FileName
 	if filename == "" || filename == "file" || filename == "getfile" || filename == "downloaded_file" {
 		filename = "document"
@@ -90,11 +79,9 @@ func (s *LocalStore) Fetch(ctx context.Context, att domain.Attachment) (string, 
 	}
 	filename = filepath.Base(filename)
 
-	// Добавляем расширение, если его нет
-	if !strings.Contains(filename, ".") && ext != "" {
+	// Если в имени нет точки — добавляем найденное расширение
+	if !strings.Contains(filename, ".") {
 		filename += ext
-	} else if !strings.Contains(filename, ".") && ext == "" {
-		filename += ".bin"
 	}
 
 	key := fmt.Sprintf("%d_%s", time.Now().UnixNano(), filename)
@@ -106,8 +93,10 @@ func (s *LocalStore) Fetch(ctx context.Context, att domain.Attachment) (string, 
 	}
 	defer out.Close()
 
+	// 6. Сохраняем полный поток
 	written, err := io.Copy(out, reader)
 	if err != nil {
+		os.Remove(fpath)
 		return "", err
 	}
 	if written == 0 {
