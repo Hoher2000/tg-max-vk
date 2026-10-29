@@ -88,16 +88,29 @@ func (r *Router) handle(ctx context.Context, msg *domain.Message) {
 	}
 
 	// 2. Ищем подходящие маршруты.
-	matched := 0
+	// По умолчанию считаем, что это создание
+	if msg.Action == "" {
+		msg.Action = domain.ActionCreate
+	}
+
+	var matched bool
 	for _, route := range r.routes {
 		if !route.matches(msg) {
 			continue
 		}
-		matched++
-		r.forward(ctx, msg, route)
+		matched = true
+
+		switch msg.Action {
+		case domain.ActionCreate:
+			r.forward(ctx, msg, route)
+		case domain.ActionEdit:
+			r.handleEdit(ctx, msg, route)
+		case domain.ActionDelete:
+			r.handleDelete(ctx, msg, route)
+		}
 	}
 
-	if matched == 0 {
+	if !matched {
 		r.log.Debug("no matching routes",
 			"adapter", msg.AdapterName,
 			"chat", msg.Ref.Chat.String(),
@@ -115,6 +128,90 @@ func (r *Router) forward(ctx context.Context, msg *domain.Message, route Route) 
 				"target_chat", target.Chat.String(),
 				"err", err,
 			)
+		}
+	}
+}
+
+// handleEdit находит, куда было переслано сообщение, и редактирует его
+func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Route) {
+	links, err := r.store.LookupTargets(ctx, msg.Ref)
+	if err != nil {
+		r.log.Error("failed to lookup targets for edit", "err", err)
+		return
+	}
+
+	for _, link := range links {
+		// Проверяем, что цель совпадает с целью маршрута
+		isTarget := false
+		for _, t := range route.Targets {
+			if t.Chat.Equal(link.Target.Chat) {
+				isTarget = true
+				break
+			}
+		}
+		if !isTarget {
+			continue
+		}
+
+		// Правильный поиск адаптера:
+		var targetAdapter domain.Adapter
+		for _, t := range route.Targets {
+			if t.Chat.Equal(link.Target.Chat) {
+				targetAdapter = r.adapters[t.Adapter]
+				break
+			}
+		}
+
+		if targetAdapter == nil {
+			continue
+		}
+
+		editor, ok := targetAdapter.(domain.Editor)
+		if !ok {
+			r.log.Warn("target adapter doesn't support edit", "adapter", targetAdapter.Name())
+			continue
+		}
+
+		// Отправляем запрос на редактирование
+		if err := editor.Edit(ctx, link.Target, msg.Text); err != nil {
+			r.log.Error("failed to edit message", "adapter", targetAdapter.Name(), "err", err)
+		} else {
+			r.log.Info("message edited", "target", link.Target.Chat.String(), "msg_id", link.Target.ID)
+		}
+	}
+}
+
+// handleDelete удаляет сообщение в целевых чатах
+func (r *Router) handleDelete(ctx context.Context, msg *domain.Message, route Route) {
+	links, err := r.store.LookupTargets(ctx, msg.Ref)
+	if err != nil {
+		r.log.Error("failed to lookup targets for delete", "err", err)
+		return
+	}
+
+	for _, link := range links {
+		var targetAdapter domain.Adapter
+		for _, t := range route.Targets {
+			if t.Chat.Equal(link.Target.Chat) {
+				targetAdapter = r.adapters[t.Adapter]
+				break
+			}
+		}
+
+		if targetAdapter == nil {
+			continue
+		}
+
+		deleter, ok := targetAdapter.(domain.Deleter)
+		if !ok {
+			r.log.Warn("target adapter doesn't support delete", "adapter", targetAdapter.Name())
+			continue
+		}
+
+		if err := deleter.Delete(ctx, link.Target); err != nil {
+			r.log.Error("failed to delete message", "adapter", targetAdapter.Name(), "err", err)
+		} else {
+			r.log.Info("message deleted", "target", link.Target.Chat.String(), "msg_id", link.Target.ID)
 		}
 	}
 }

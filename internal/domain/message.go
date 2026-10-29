@@ -35,10 +35,19 @@ func (r MessageRef) IsZero() bool {
 	return r.ID == "" && r.Chat.ID() == ""
 }
 
+type MessageAction string
+
+const (
+	ActionCreate MessageAction = "create"
+	ActionEdit   MessageAction = "edit"
+	ActionDelete MessageAction = "delete"
+)
+
 // Message — универсальное сообщение моста.
 type Message struct {
 	Ref         MessageRef
-	AdapterName string // имя инстанса адаптера, который доставил сообщение
+	Action      MessageAction // <--- Добавили
+	AdapterName string
 	SenderID    string
 	SenderName  string
 	Text        string
