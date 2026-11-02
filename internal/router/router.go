@@ -143,25 +143,41 @@ func (r *Router) findTargetAdapter(route Route, targetChat domain.ChatID) (domai
 }
 
 func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Route) {
-	// Пытаемся найти, куда мы пересылали это сообщение (если оно source)
 	links, _ := r.store.LookupTargets(ctx, msg.Ref)
 
-	// Если не нашли как source, значит оно target. Ищем оригинал.
+	// Если это было целью (target), обновляем оригинал (source)
 	if len(links) == 0 {
 		srcLink, err := r.store.LookupSource(ctx, msg.Ref)
 		if err == nil && srcLink != nil {
-			// Нашли оригинал. Обновляем его.
 			sourceAdapter, _ := r.findTargetAdapter(route, srcLink.Source.Chat)
 			if sourceAdapter != nil {
+				// Медиа
+				if len(msg.Attachments) > 0 {
+					if mediaEditor, ok := sourceAdapter.(domain.MediaEditor); ok {
+						if err := mediaEditor.EditMedia(ctx, srcLink.Source, msg); err != nil {
+							r.log.Error("failed to edit media (source)", "adapter", sourceAdapter.Name(), "err", err)
+						} else {
+							r.log.Info("message media edited (source)", "chat", srcLink.Source.Chat.String(), "msg_id", srcLink.Source.ID)
+						}
+						return
+					}
+				}
+				// Текст
 				if editor, ok := sourceAdapter.(domain.Editor); ok {
-					_ = editor.Edit(ctx, srcLink.Source, msg.Text)
+					if err := editor.Edit(ctx, srcLink.Source, msg.Text); err != nil {
+						if !strings.Contains(err.Error(), "MESSAGE_NOT_MODIFIED") {
+							r.log.Error("failed to edit text (source)", "adapter", sourceAdapter.Name(), "err", err)
+						}
+					} else {
+						r.log.Info("message edited (source)", "chat", srcLink.Source.Chat.String(), "msg_id", srcLink.Source.ID)
+					}
 				}
 			}
 		}
 		return
 	}
 
-	// Сообщение — источник. Обновляем все цели.
+	// Если это был источник (source), обновляем все цели (targets)
 	for _, link := range links {
 		targetAdapter, _ := r.findTargetAdapter(route, link.Target.Chat)
 		if targetAdapter == nil {
@@ -170,13 +186,23 @@ func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Rout
 
 		if len(msg.Attachments) > 0 {
 			if mediaEditor, ok := targetAdapter.(domain.MediaEditor); ok {
-				_ = mediaEditor.EditMedia(ctx, link.Target, msg)
+				if err := mediaEditor.EditMedia(ctx, link.Target, msg); err != nil {
+					r.log.Error("failed to edit media (target)", "adapter", targetAdapter.Name(), "err", err)
+				} else {
+					r.log.Info("message media edited (target)", "chat", link.Target.Chat.String(), "msg_id", link.Target.ID)
+				}
 				continue
 			}
 		}
 
 		if editor, ok := targetAdapter.(domain.Editor); ok {
-			_ = editor.Edit(ctx, link.Target, msg.Text)
+			if err := editor.Edit(ctx, link.Target, msg.Text); err != nil {
+				if !strings.Contains(err.Error(), "MESSAGE_NOT_MODIFIED") {
+					r.log.Error("failed to edit text (target)", "adapter", targetAdapter.Name(), "err", err)
+				}
+			} else {
+				r.log.Info("message edited (target)", "chat", link.Target.Chat.String(), "msg_id", link.Target.ID)
+			}
 		}
 	}
 }
@@ -190,7 +216,11 @@ func (r *Router) handleDelete(ctx context.Context, msg *domain.Message, route Ro
 			sourceAdapter, _ := r.findTargetAdapter(route, srcLink.Source.Chat)
 			if sourceAdapter != nil {
 				if deleter, ok := sourceAdapter.(domain.Deleter); ok {
-					_ = deleter.Delete(ctx, srcLink.Source)
+					if err := deleter.Delete(ctx, srcLink.Source); err != nil {
+						r.log.Error("failed to delete message (source)", "adapter", sourceAdapter.Name(), "err", err)
+					} else {
+						r.log.Info("message deleted (source)", "chat", srcLink.Source.Chat.String(), "msg_id", srcLink.Source.ID)
+					}
 				}
 			}
 		}
@@ -202,8 +232,13 @@ func (r *Router) handleDelete(ctx context.Context, msg *domain.Message, route Ro
 		if targetAdapter == nil {
 			continue
 		}
+
 		if deleter, ok := targetAdapter.(domain.Deleter); ok {
-			_ = deleter.Delete(ctx, link.Target)
+			if err := deleter.Delete(ctx, link.Target); err != nil {
+				r.log.Error("failed to delete message (target)", "adapter", targetAdapter.Name(), "err", err)
+			} else {
+				r.log.Info("message deleted (target)", "chat", link.Target.Chat.String(), "msg_id", link.Target.ID)
+			}
 		}
 	}
 }

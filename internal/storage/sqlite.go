@@ -57,6 +57,11 @@ func NewSQLite(path string) (*SQLiteStore, error) {
 func (s *SQLiteStore) DB() *sql.DB { return s.db }
 
 func (s *SQLiteStore) SaveLink(ctx context.Context, link domain.MessageLink) error {
+	// Защита от битых записей
+	if link.Source.Chat.ID() == "" || link.Target.Chat.ID() == "" {
+		return fmt.Errorf("cannot save link: source or target chat ID is empty")
+	}
+
 	const q = `
 		INSERT INTO message_links (
 			source_platform, source_chat, source_message_id,
