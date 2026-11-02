@@ -3,20 +3,15 @@ package max
 // Update — объект обновления от MAX API.
 // В зависимости от update_type заполняются разные поля.
 type Update struct {
-	UpdateType string `json:"update_type"`
-	Timestamp  int64  `json:"timestamp"`
-	ChatID     int64  `json:"chat_id,omitempty"`
-	UserID     int64  `json:"user_id,omitempty"`
-	IsChannel  bool   `json:"is_channel,omitempty"`
-
-	// message_created / message_edited
-	Message *Message `json:"message,omitempty"`
-
-	// message_callback
-	Callback *Callback `json:"callback,omitempty"`
-
-	// marker для Long Polling
-	Marker int64 `json:"marker,omitempty"`
+	UpdateType string    `json:"update_type"`
+	Timestamp  int64     `json:"timestamp"`
+	ChatID     int64     `json:"chat_id,omitempty"`    // <--- Для удаления
+	MessageID  string    `json:"message_id,omitempty"` // <--- Для удаления
+	UserID     int64     `json:"user_id,omitempty"`
+	IsChannel  bool      `json:"is_channel,omitempty"`
+	Message    *Message  `json:"message,omitempty"`
+	Callback   *Callback `json:"callback,omitempty"`
+	Marker     int64     `json:"marker,omitempty"`
 }
 
 // UpdatesResponse — ответ на GET /updates.

@@ -132,86 +132,78 @@ func (r *Router) forward(ctx context.Context, msg *domain.Message, route Route) 
 	}
 }
 
-// handleEdit находит, куда было переслано сообщение, и редактирует его
+// findTargetAdapter ищет адаптер и чат для конкретной цели из маршрута.
+func (r *Router) findTargetAdapter(route Route, targetChat domain.ChatID) (domain.Adapter, domain.ChatID) {
+	for _, t := range route.Targets {
+		if t.Chat.Equal(targetChat) {
+			return r.adapters[t.Adapter], t.Chat
+		}
+	}
+	return nil, domain.ChatID{}
+}
+
 func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Route) {
-	links, err := r.store.LookupTargets(ctx, msg.Ref)
-	if err != nil {
-		r.log.Error("failed to lookup targets for edit", "err", err)
+	// Пытаемся найти, куда мы пересылали это сообщение (если оно source)
+	links, _ := r.store.LookupTargets(ctx, msg.Ref)
+
+	// Если не нашли как source, значит оно target. Ищем оригинал.
+	if len(links) == 0 {
+		srcLink, err := r.store.LookupSource(ctx, msg.Ref)
+		if err == nil && srcLink != nil {
+			// Нашли оригинал. Обновляем его.
+			sourceAdapter, _ := r.findTargetAdapter(route, srcLink.Source.Chat)
+			if sourceAdapter != nil {
+				if editor, ok := sourceAdapter.(domain.Editor); ok {
+					_ = editor.Edit(ctx, srcLink.Source, msg.Text)
+				}
+			}
+		}
 		return
 	}
 
+	// Сообщение — источник. Обновляем все цели.
 	for _, link := range links {
-		// Проверяем, что цель совпадает с целью маршрута
-		isTarget := false
-		for _, t := range route.Targets {
-			if t.Chat.Equal(link.Target.Chat) {
-				isTarget = true
-				break
-			}
-		}
-		if !isTarget {
-			continue
-		}
-
-		// Правильный поиск адаптера:
-		var targetAdapter domain.Adapter
-		for _, t := range route.Targets {
-			if t.Chat.Equal(link.Target.Chat) {
-				targetAdapter = r.adapters[t.Adapter]
-				break
-			}
-		}
-
+		targetAdapter, _ := r.findTargetAdapter(route, link.Target.Chat)
 		if targetAdapter == nil {
 			continue
 		}
 
-		editor, ok := targetAdapter.(domain.Editor)
-		if !ok {
-			r.log.Warn("target adapter doesn't support edit", "adapter", targetAdapter.Name())
-			continue
+		if len(msg.Attachments) > 0 {
+			if mediaEditor, ok := targetAdapter.(domain.MediaEditor); ok {
+				_ = mediaEditor.EditMedia(ctx, link.Target, msg)
+				continue
+			}
 		}
 
-		// Отправляем запрос на редактирование
-		if err := editor.Edit(ctx, link.Target, msg.Text); err != nil {
-			r.log.Error("failed to edit message", "adapter", targetAdapter.Name(), "err", err)
-		} else {
-			r.log.Info("message edited", "target", link.Target.Chat.String(), "msg_id", link.Target.ID)
+		if editor, ok := targetAdapter.(domain.Editor); ok {
+			_ = editor.Edit(ctx, link.Target, msg.Text)
 		}
 	}
 }
 
-// handleDelete удаляет сообщение в целевых чатах
 func (r *Router) handleDelete(ctx context.Context, msg *domain.Message, route Route) {
-	links, err := r.store.LookupTargets(ctx, msg.Ref)
-	if err != nil {
-		r.log.Error("failed to lookup targets for delete", "err", err)
+	links, _ := r.store.LookupTargets(ctx, msg.Ref)
+
+	if len(links) == 0 {
+		srcLink, err := r.store.LookupSource(ctx, msg.Ref)
+		if err == nil && srcLink != nil {
+			sourceAdapter, _ := r.findTargetAdapter(route, srcLink.Source.Chat)
+			if sourceAdapter != nil {
+				if deleter, ok := sourceAdapter.(domain.Deleter); ok {
+					_ = deleter.Delete(ctx, srcLink.Source)
+				}
+			}
+		}
 		return
 	}
 
 	for _, link := range links {
-		var targetAdapter domain.Adapter
-		for _, t := range route.Targets {
-			if t.Chat.Equal(link.Target.Chat) {
-				targetAdapter = r.adapters[t.Adapter]
-				break
-			}
-		}
-
+		targetAdapter, _ := r.findTargetAdapter(route, link.Target.Chat)
 		if targetAdapter == nil {
 			continue
 		}
-
-		deleter, ok := targetAdapter.(domain.Deleter)
-		if !ok {
-			r.log.Warn("target adapter doesn't support delete", "adapter", targetAdapter.Name())
-			continue
-		}
-
-		if err := deleter.Delete(ctx, link.Target); err != nil {
-			r.log.Error("failed to delete message", "adapter", targetAdapter.Name(), "err", err)
-		} else {
-			r.log.Info("message deleted", "target", link.Target.Chat.String(), "msg_id", link.Target.ID)
+		if deleter, ok := targetAdapter.(domain.Deleter); ok {
+			_ = deleter.Delete(ctx, link.Target)
 		}
 	}
 }

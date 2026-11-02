@@ -50,6 +50,8 @@ func (c *Client) getUpdates(ctx context.Context, marker int64, timeout int) (*Up
 		q.Set("timeout", strconv.Itoa(timeout))
 	}
 	q.Set("limit", "100")
+	// Явно запрашиваем все нужные типы событий
+	q.Set("update_types", "message_created,message_edited,message_removed")
 
 	endpoint := c.baseURL + "/updates?" + q.Encode()
 
@@ -293,4 +295,80 @@ func (c *Client) uploadMedia(ctx context.Context, att domain.Attachment, r io.Re
 	}
 
 	return "", fmt.Errorf("token not found in upload response. body: %s", string(bodyBytes))
+}
+
+func (c *Client) editMessageWithAttachments(ctx context.Context, messageID string, text string, attachments []Attachment) error {
+	endpoint := fmt.Sprintf("%s/messages?message_id=%s", c.baseURL, messageID)
+
+	body := SendMessageRequest{
+		Text:        text,
+		Attachments: attachments,
+	}
+	payload, _ := json.Marshal(body)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("http do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("max edit media failed %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+func (c *Client) editMessage(ctx context.Context, messageID string, text string) error {
+	endpoint := fmt.Sprintf("%s/messages?message_id=%s", c.baseURL, messageID)
+	body := SendMessageRequest{Text: text}
+	payload, _ := json.Marshal(body)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("http do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("max edit failed %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+func (c *Client) deleteMessage(ctx context.Context, messageID string) error {
+	endpoint := fmt.Sprintf("%s/messages?message_id=%s", c.baseURL, messageID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", c.token)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("http do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("max delete failed %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
 }

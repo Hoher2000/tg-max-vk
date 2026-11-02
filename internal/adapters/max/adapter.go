@@ -119,12 +119,52 @@ func (a *Adapter) Stop(ctx context.Context) error {
 // convertUpdate превращает Update в domain.Message.
 // Возвращает nil, если событие не является новым сообщением.
 func (a *Adapter) convertUpdate(u Update) *domain.Message {
-	if u.UpdateType != "message_created" || u.Message == nil {
+	// 1. Обработка удаления (в MAX тип события "message_removed")
+	if u.UpdateType == "message_removed" {
+		var mid string
+		var chat domain.ChatID
+
+		// ID сообщения может лежать в Message или в корне Update
+		if u.Message != nil && u.Message.Body != nil {
+			mid = u.Message.Body.Mid
+		} else if u.MessageID != "" {
+			mid = u.MessageID
+		}
+
+		// Пытаемся достать ChatID
+		var chatID int64
+		var chatKind domain.ChatKind = domain.ChatKindChannel
+
+		if u.ChatID != 0 {
+			chatID = u.ChatID
+		} else if u.Message != nil && u.Message.Recipient != nil {
+			if u.Message.Recipient.ChatID != 0 {
+				chatID = u.Message.Recipient.ChatID
+			} else if u.Message.Recipient.UserID != 0 {
+				chatID = u.Message.Recipient.UserID
+				chatKind = domain.ChatKindUser
+			}
+		}
+
+		if chatID != 0 {
+			chat, _ = domain.NewChatID(domain.PlatformMax, chatKind, strconv.FormatInt(chatID, 10))
+		}
+
+		return &domain.Message{
+			Action:      domain.ActionDelete,
+			AdapterName: a.name,
+			Ref:         domain.MessageRef{Chat: chat, ID: mid},
+			Meta:        make(map[string]any),
+		}
+	}
+
+	// 2. Обработка создания и редактирования
+	if u.UpdateType != "message_created" && u.UpdateType != "message_edited" {
 		return nil
 	}
 
 	msg := u.Message
-	if msg.Body == nil {
+	if msg == nil || msg.Body == nil {
 		return nil
 	}
 
@@ -160,19 +200,25 @@ func (a *Adapter) convertUpdate(u Update) *domain.Message {
 		return nil
 	}
 
-	// Сначала создаем само сообщение!
+	// Выставляем действие
+	action := domain.ActionCreate
+	if u.UpdateType == "message_edited" {
+		action = domain.ActionEdit
+	}
+
 	out := &domain.Message{
 		Ref: domain.MessageRef{
 			Chat: chat,
 			ID:   msg.Body.Mid,
 		},
+		Action:      action, // <--- Теперь тут правильный Action
 		AdapterName: a.name,
 		Text:        msg.Body.Text,
 		Timestamp:   time.UnixMilli(msg.Timestamp),
 		Meta:        make(map[string]any),
 	}
 
-	// ТЕПЕРЬ парсим вложения и добавляем их в out.Attachments
+	// Парсим вложения
 	for _, att := range msg.Body.Attachments {
 		attType := domain.AttachmentDocument
 		if att.Type == "image" {
@@ -181,7 +227,6 @@ func (a *Adapter) convertUpdate(u Update) *domain.Message {
 			attType = domain.AttachmentVideo
 		}
 
-		// Извлекаем URL из payload
 		var fileURL string
 		if payloadMap, ok := att.Payload.(map[string]any); ok {
 			if u, ok := payloadMap["url"].(string); ok {
@@ -207,7 +252,7 @@ func (a *Adapter) convertUpdate(u Update) *domain.Message {
 		}
 	}
 
-	// Reply через link.
+	// Reply через link
 	if msg.Link != nil && msg.Link.Type == "reply" && msg.Link.Body != nil {
 		out.ReplyTo = &domain.MessageRef{
 			Chat: chat,
@@ -327,4 +372,46 @@ func (a *Adapter) prepareAttachments(ctx context.Context, msg *domain.Message) [
 		})
 	}
 	return attachments
+}
+
+func (a *Adapter) EditMedia(ctx context.Context, ref domain.MessageRef, msg *domain.Message) error {
+	// 1. Загружаем новое вложение
+	var newAttachments []Attachment
+	for _, att := range msg.Attachments {
+		file, err := a.media.Open(ctx, att.MediaKey)
+		if err != nil {
+			a.log.Error("failed to open media", "key", att.MediaKey, "err", err)
+			continue
+		}
+
+		token, err := a.client.uploadMedia(ctx, att, file)
+		file.Close()
+		if err != nil {
+			a.log.Error("failed to upload media to max", "err", err)
+			continue
+		}
+
+		attType := "image"
+		if att.Type == domain.AttachmentVideo {
+			attType = "video"
+		} else if att.Type == domain.AttachmentDocument {
+			attType = "file"
+		}
+
+		newAttachments = append(newAttachments, Attachment{
+			Type:    attType,
+			Payload: map[string]any{"token": token},
+		})
+	}
+
+	// 2. Отправляем запрос на редактирование с новыми вложениями
+	return a.client.editMessageWithAttachments(ctx, ref.ID, msg.Text, newAttachments)
+}
+
+func (a *Adapter) Edit(ctx context.Context, ref domain.MessageRef, newText string) error {
+	return a.client.editMessage(ctx, ref.ID, newText)
+}
+
+func (a *Adapter) Delete(ctx context.Context, ref domain.MessageRef) error {
+	return a.client.deleteMessage(ctx, ref.ID)
 }

@@ -82,3 +82,9 @@ type MediaFetcher interface {
 	// FetchMedia скачивает вложения в MediaStore и обновляет msg.Attachments.
 	FetchMedia(ctx context.Context, msg *Message) error
 }
+
+// MediaEditor — опциональный интерфейс для адаптеров, которые умеют
+// редактировать медиа-вложения в уже существующем сообщении.
+type MediaEditor interface {
+	EditMedia(ctx context.Context, ref MessageRef, msg *Message) error
+}

@@ -62,8 +62,7 @@ func (s *SQLiteStore) SaveLink(ctx context.Context, link domain.MessageLink) err
 			source_platform, source_chat, source_message_id,
 			target_platform, target_chat, target_message_id
 		) VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(source_platform, source_chat, source_message_id,
-		            target_platform, target_chat)
+		ON CONFLICT(source_platform, source_chat, source_message_id, target_platform, target_chat)
 		DO UPDATE SET target_message_id = excluded.target_message_id
 	`
 	_, err := s.db.ExecContext(ctx, q,
@@ -77,14 +76,26 @@ func (s *SQLiteStore) SaveLink(ctx context.Context, link domain.MessageLink) err
 }
 
 func (s *SQLiteStore) LookupTargets(ctx context.Context, src domain.MessageRef) ([]domain.MessageLink, error) {
-	const q = `
-		SELECT target_platform, target_chat, target_message_id
-		FROM message_links
-		WHERE source_platform = ? AND source_chat = ? AND source_message_id = ?
-	`
-	rows, err := s.db.QueryContext(ctx, q,
-		string(src.Chat.Platform()), src.Chat.String(), src.ID,
+	var (
+		rows *sql.Rows
+		err  error
 	)
+
+	if src.Chat.ID() != "" {
+		const q = `
+			SELECT target_platform, target_chat, target_message_id
+			FROM message_links
+			WHERE source_platform = ? AND source_chat = ? AND source_message_id = ?
+		`
+		rows, err = s.db.QueryContext(ctx, q, string(src.Chat.Platform()), src.Chat.String(), src.ID)
+	} else {
+		const q = `
+			SELECT target_platform, target_chat, target_message_id
+			FROM message_links
+			WHERE source_message_id = ?
+		`
+		rows, err = s.db.QueryContext(ctx, q, src.ID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("lookup targets: %w", err)
 	}
@@ -92,23 +103,18 @@ func (s *SQLiteStore) LookupTargets(ctx context.Context, src domain.MessageRef) 
 
 	var links []domain.MessageLink
 	for rows.Next() {
-		var (
-			tgtPlatform, tgtChatRaw, tgtMessageID string
-		)
+		var tgtPlatform, tgtChatRaw, tgtMessageID string
 		if err := rows.Scan(&tgtPlatform, &tgtChatRaw, &tgtMessageID); err != nil {
 			return nil, fmt.Errorf("scan target: %w", err)
 		}
 		tgtChat, err := domain.ParseChatID(tgtChatRaw)
 		if err != nil {
-			return nil, fmt.Errorf("parse target chat %q: %w", tgtChatRaw, err)
+			continue // Пропускаем битые записи
 		}
 		links = append(links, domain.MessageLink{
 			Source: src,
 			Target: domain.MessageRef{Chat: tgtChat, ID: tgtMessageID},
 		})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows: %w", err)
 	}
 	return links, nil
 }

@@ -91,10 +91,13 @@ func (a *Adapter) Start(ctx context.Context, out chan<- *domain.Message) error {
 	}()
 
 	a.log.Info("telegram adapter starting", "session", a.sessionName)
-
 	dispatcher := tg.NewUpdateDispatcher()
 	dispatcher.OnNewMessage(a.onNewMessage(out))
 	dispatcher.OnNewChannelMessage(a.onNewChannelMessage(out))
+	dispatcher.OnEditMessage(a.onEditMessage(out))
+	dispatcher.OnEditChannelMessage(a.onEditChannelMessage(out))
+	dispatcher.OnDeleteMessages(a.onDeleteMessages(out))
+	dispatcher.OnDeleteChannelMessages(a.onDeleteChannelMessages(out))
 
 	a.client = telegram.NewClient(a.apiID, a.apiHash, telegram.Options{
 		SessionStorage: newSessionStorage(a.db, a.sessionName),
@@ -705,4 +708,192 @@ func (a *Adapter) refreshMessage(ctx context.Context, chatID domain.ChatID, msgI
 	}
 
 	return nil, fmt.Errorf("message %d not found in getHistory response", msgID)
+}
+
+func (a *Adapter) onEditMessage(out chan<- *domain.Message) tg.EditMessageHandler {
+	return func(ctx context.Context, e tg.Entities, u *tg.UpdateEditMessage) error {
+		msg, ok := u.Message.(*tg.Message)
+		if !ok {
+			return nil
+		}
+		return a.handleEditMsg(ctx, msg, out)
+	}
+}
+
+func (a *Adapter) onEditChannelMessage(out chan<- *domain.Message) tg.EditChannelMessageHandler {
+	return func(ctx context.Context, e tg.Entities, u *tg.UpdateEditChannelMessage) error {
+		msg, ok := u.Message.(*tg.Message)
+		if !ok {
+			return nil
+		}
+		return a.handleEditMsg(ctx, msg, out)
+	}
+}
+
+func (a *Adapter) handleEditMsg(ctx context.Context, msg *tg.Message, out chan<- *domain.Message) error {
+	chatID, err := chatIDFromPeer(msg.PeerID)
+	if err != nil {
+		return nil
+	}
+
+	coreMsg := &domain.Message{
+		Ref:         domain.MessageRef{Chat: chatID, ID: strconv.Itoa(msg.ID)},
+		Action:      domain.ActionEdit,
+		AdapterName: a.name,
+		Text:        msg.Message,
+		Timestamp:   time.Unix(int64(msg.Date), 0),
+		Meta:        make(map[string]any),
+	}
+
+	// Если в отредактированном сообщении есть медиа, нам нужно его скачать!
+	if msg.Media != nil {
+		// Скачиваем медиа, если оно есть (используя твою функцию downloadMedia)
+		atts, err := a.downloadMedia(ctx, chatID, msg.ID)
+		if err == nil {
+			coreMsg.Attachments = atts
+		} else {
+			a.log.Error("failed to download media on edit", "err", err)
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case out <- coreMsg:
+	}
+	return nil
+}
+
+func (a *Adapter) onDeleteMessages(out chan<- *domain.Message) tg.DeleteMessagesHandler {
+	return func(ctx context.Context, e tg.Entities, u *tg.UpdateDeleteMessages) error {
+		for _, id := range u.Messages {
+			out <- &domain.Message{
+				Action:      domain.ActionDelete,
+				AdapterName: a.name,
+				Ref:         domain.MessageRef{ID: strconv.Itoa(id)}, // Chat неизвестен
+			}
+		}
+		return nil
+	}
+}
+
+func (a *Adapter) onDeleteChannelMessages(out chan<- *domain.Message) tg.DeleteChannelMessagesHandler {
+	return func(ctx context.Context, e tg.Entities, u *tg.UpdateDeleteChannelMessages) error {
+		peerID := channelIDToPeerID(u.ChannelID)
+		chatID, _ := domain.NewChatID(domain.PlatformTelegram, domain.ChatKindChannel, strconv.FormatInt(peerID, 10))
+
+		for _, id := range u.Messages {
+			out <- &domain.Message{
+				Action:      domain.ActionDelete,
+				AdapterName: a.name,
+				Ref:         domain.MessageRef{Chat: chatID, ID: strconv.Itoa(id)},
+			}
+		}
+		return nil
+	}
+}
+
+func (a *Adapter) EditMedia(ctx context.Context, ref domain.MessageRef, msg *domain.Message) error {
+	peer, err := a.resolveInputPeer(ctx, ref.Chat)
+	if err != nil {
+		return err
+	}
+
+	msgID, err := strconv.Atoi(ref.ID)
+	if err != nil {
+		return fmt.Errorf("invalid message id: %w", err)
+	}
+
+	if len(msg.Attachments) == 0 {
+		return fmt.Errorf("no attachments to edit")
+	}
+
+	att := msg.Attachments[0]
+	file, err := a.media.Open(ctx, att.MediaKey)
+	if err != nil {
+		return fmt.Errorf("open media: %w", err)
+	}
+	defer file.Close()
+
+	up := uploader.NewUploader(a.api)
+
+	// Получаем билдер для редактирования сообщения
+	builder := a.sender.To(peer).Edit(msgID)
+
+	// Дальше логика почти идентична отправке нового сообщения
+	if att.Type == domain.AttachmentPhoto {
+		imgData, err := io.ReadAll(file)
+		if err != nil {
+			return fmt.Errorf("read image: %w", err)
+		}
+		img, _, err := image.Decode(bytes.NewReader(imgData))
+		if err != nil {
+			return fmt.Errorf("decode image: %w", err)
+		}
+		var buf bytes.Buffer
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90}); err != nil {
+			return fmt.Errorf("encode jpeg: %w", err)
+		}
+
+		tgFile, err := up.FromBytes(ctx, "photo.jpg", buf.Bytes())
+		if err != nil {
+			return fmt.Errorf("upload photo: %w", err)
+		}
+
+		// Отправляем на редактирование как фото
+		_, err = builder.Media(ctx, message.UploadedPhoto(tgFile, styling.Plain(msg.Text)))
+		return err
+	}
+
+	// Для видео и документов
+	tgFile, err := up.FromReader(ctx, att.FileName, file)
+	if err != nil {
+		return fmt.Errorf("upload file: %w", err)
+	}
+
+	_, err = builder.Media(ctx, message.UploadedDocument(tgFile, styling.Plain(msg.Text)))
+	return err
+}
+
+func (a *Adapter) Edit(ctx context.Context, ref domain.MessageRef, newText string) error {
+	peer, err := a.resolveInputPeer(ctx, ref.Chat)
+	if err != nil {
+		return err
+	}
+
+	msgID, err := strconv.Atoi(ref.ID)
+	if err != nil {
+		return fmt.Errorf("invalid message id: %w", err)
+	}
+
+	_, err = a.sender.To(peer).Edit(msgID).Text(ctx, newText)
+	return err
+}
+
+func (a *Adapter) Delete(ctx context.Context, ref domain.MessageRef) error {
+	peer, err := a.resolveInputPeer(ctx, ref.Chat)
+	if err != nil {
+		return err
+	}
+
+	msgID, err := strconv.Atoi(ref.ID)
+	if err != nil {
+		return fmt.Errorf("invalid message id: %w", err)
+	}
+
+	// В gotd/td удаление делается через сырой API
+	switch p := peer.(type) {
+	case *tg.InputPeerChannel:
+		_, err = a.api.ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{
+			Channel: &tg.InputChannel{ChannelID: p.ChannelID, AccessHash: p.AccessHash},
+			ID:      []int{msgID},
+		})
+	default:
+		_, err = a.api.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{
+			Revoke: true,
+			ID:     []int{msgID},
+		})
+	}
+
+	return err
 }
