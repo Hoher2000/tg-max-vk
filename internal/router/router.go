@@ -43,30 +43,30 @@ func New(
 // Run запускает все адаптеры и обрабатывает входящие сообщения до отмены ctx.
 func (r *Router) Run(ctx context.Context) error {
 	messages := make(chan *domain.Message, 256)
-
 	g, gctx := errgroup.WithContext(ctx)
 
-	// Запускаем адаптеры.
 	for name, adapter := range r.adapters {
 		name, adapter := name, adapter
 		g.Go(func() error {
 			r.log.Info("adapter starting", "name", name, "platform", adapter.Platform())
 			err := adapter.Start(gctx, messages)
 			if err != nil && gctx.Err() == nil {
-				return fmt.Errorf("adapter %s: %w", name, err)
+				// Логируем, но не роняем весь мост, если упал один адаптер
+				r.log.Error("adapter stopped with error", "name", name, "err", err)
 			}
-			r.log.Info("adapter stopped", "name", name)
-			return nil
+			return nil // не возвращаем ошибку в errgroup, чтобы не отменять другие адаптеры
 		})
 	}
 
-	// Запускаем обработчик сообщений.
 	g.Go(func() error {
 		for {
 			select {
 			case <-gctx.Done():
 				return nil
-			case msg := <-messages:
+			case msg, ok := <-messages:
+				if !ok || msg == nil {
+					return nil // канал закрыт
+				}
 				r.handle(gctx, msg)
 			}
 		}
@@ -89,8 +89,9 @@ func (r *Router) handle(ctx context.Context, msg *domain.Message) {
 
 	// 2. Ищем подходящие маршруты.
 	// По умолчанию считаем, что это создание
-	if msg.Action == "" {
-		msg.Action = domain.ActionCreate
+	action := msg.Action
+	if action == "" {
+		action = domain.ActionCreate
 	}
 
 	var matched bool
@@ -100,7 +101,7 @@ func (r *Router) handle(ctx context.Context, msg *domain.Message) {
 		}
 		matched = true
 
-		switch msg.Action {
+		switch action { // используем локальную action
 		case domain.ActionCreate:
 			r.forward(ctx, msg, route)
 		case domain.ActionEdit:
@@ -158,18 +159,25 @@ func (r *Router) fetchPendingMedia(ctx context.Context, msg *domain.Message) {
 }
 
 func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Route) {
-	// 1. Скачиваем новые вложения (если они пришли по URL)
 	r.fetchPendingMedia(ctx, msg)
 
-	links, _ := r.store.LookupTargets(ctx, msg.Ref)
+	links, err := r.store.LookupTargets(ctx, msg.Ref)
+	if err != nil {
+		r.log.Error("failed to lookup targets for edit", "err", err)
+		return
+	}
 
-	// Если это было целью (target), обновляем оригинал (source)
 	if len(links) == 0 {
 		srcLink, err := r.store.LookupSource(ctx, msg.Ref)
-		if err == nil && srcLink != nil {
+		if err != nil {
+			if !errors.Is(err, domain.ErrNotFound) {
+				r.log.Error("failed to lookup source for edit", "err", err)
+			}
+			return
+		}
+		if srcLink != nil {
 			sourceAdapter, _ := r.findTargetAdapter(route, srcLink.Source.Chat)
 			if sourceAdapter != nil {
-				// Медиа
 				if len(msg.Attachments) > 0 {
 					if mediaEditor, ok := sourceAdapter.(domain.MediaEditor); ok {
 						if err := mediaEditor.EditMedia(ctx, srcLink.Source, msg); err != nil {
@@ -180,7 +188,6 @@ func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Rout
 						return
 					}
 				}
-				// Текст
 				if editor, ok := sourceAdapter.(domain.Editor); ok {
 					if err := editor.Edit(ctx, srcLink.Source, msg.Text); err != nil {
 						if !strings.Contains(err.Error(), "MESSAGE_NOT_MODIFIED") {
@@ -195,7 +202,6 @@ func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Rout
 		return
 	}
 
-	// Если это был источник (source), обновляем все цели (targets)
 	for _, link := range links {
 		targetAdapter, _ := r.findTargetAdapter(route, link.Target.Chat)
 		if targetAdapter == nil {
@@ -226,16 +232,26 @@ func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Rout
 }
 
 func (r *Router) handleDelete(ctx context.Context, msg *domain.Message, route Route) {
-	links, _ := r.store.LookupTargets(ctx, msg.Ref)
+	links, err := r.store.LookupTargets(ctx, msg.Ref)
+	if err != nil {
+		r.log.Error("failed to lookup targets for delete", "err", err)
+		return
+	}
 
 	if len(links) == 0 {
 		srcLink, err := r.store.LookupSource(ctx, msg.Ref)
-		if err == nil && srcLink != nil {
+		if err != nil {
+			if !errors.Is(err, domain.ErrNotFound) {
+				r.log.Error("failed to lookup source for delete", "err", err)
+			}
+			return
+		}
+		if srcLink != nil {
 			sourceAdapter, _ := r.findTargetAdapter(route, srcLink.Source.Chat)
 			if sourceAdapter != nil {
 				if deleter, ok := sourceAdapter.(domain.Deleter); ok {
 					if err := deleter.Delete(ctx, srcLink.Source); err != nil {
-						r.log.Error("failed to delete message (source)", "adapter", sourceAdapter.Name(), "err", err)
+						r.log.Error("failed to delete (source)", "adapter", sourceAdapter.Name(), "err", err)
 					} else {
 						r.log.Info("message deleted (source)", "chat", srcLink.Source.Chat.String(), "msg_id", srcLink.Source.ID)
 					}
@@ -253,7 +269,7 @@ func (r *Router) handleDelete(ctx context.Context, msg *domain.Message, route Ro
 
 		if deleter, ok := targetAdapter.(domain.Deleter); ok {
 			if err := deleter.Delete(ctx, link.Target); err != nil {
-				r.log.Error("failed to delete message (target)", "adapter", targetAdapter.Name(), "err", err)
+				r.log.Error("failed to delete (target)", "adapter", targetAdapter.Name(), "err", err)
 			} else {
 				r.log.Info("message deleted (target)", "chat", link.Target.Chat.String(), "msg_id", link.Target.ID)
 			}
@@ -292,7 +308,7 @@ func (r *Router) deliver(ctx context.Context, msg *domain.Message, route Route, 
 	}
 
 	// 5. Готовим сообщение к отправке
-	out := r.prepareOutgoing(ctx, msg, target)
+	out := r.prepareOutgoing(msg, target)
 
 	// 6. Защита от пустых сообщений
 	if out.Text == "" && len(out.Attachments) == 0 {
@@ -317,30 +333,23 @@ func (r *Router) tryReply(ctx context.Context, adapter domain.Adapter, msg *doma
 		return domain.MessageRef{}, domain.ErrUnsupported
 	}
 
-	targetChat := target.Chat
-
-	// Ищем, куда было переслано сообщение, на которое отвечают.
-	// Логика: у сообщения-источника (msg.ReplyTo) были какие-то линки.
-	// Нам нужен тот, у которого Target совпадает с нашей целью.
 	links, err := r.store.LookupTargets(ctx, *msg.ReplyTo)
 	if err != nil {
 		return domain.MessageRef{}, fmt.Errorf("lookup targets: %w", err)
 	}
 
 	for _, link := range links {
-		if link.Target.Chat.Equal(targetChat) {
-			// Нашли нужный target — отвечаем на него.
-			out := r.prepareOutgoing(ctx, msg, target)
+		if link.Target.Chat.Equal(target.Chat) && adapter.Name() == target.Adapter {
+			out := r.prepareOutgoing(msg, target)
 			return replier.Reply(ctx, link.Target, out)
 		}
 	}
 
-	// Сообщение не пересылалось в целевую платформу.
 	return domain.MessageRef{}, domain.ErrNotFound
 }
 
 // prepareOutgoing формирует сообщение для отправки в целевую платформу.
-func (r *Router) prepareOutgoing(ctx context.Context, msg *domain.Message, target Target) *domain.Message {
+func (r *Router) prepareOutgoing(msg *domain.Message, target Target) *domain.Message {
 	out := &domain.Message{
 		Ref:         domain.MessageRef{Chat: target.Chat},
 		AdapterName: target.Adapter,
@@ -349,31 +358,8 @@ func (r *Router) prepareOutgoing(ctx context.Context, msg *domain.Message, targe
 		Timestamp:   msg.Timestamp,
 	}
 
-	// Скачиваем медиа, если пришло по URL (например, из MAX)
-	// Скачиваем медиа, если пришло по URL (например, из MAX)
-	for i := range out.Attachments {
-		if out.Attachments[i].MediaKey == "" && out.Attachments[i].URL != "" {
-			key, err := r.media.Fetch(ctx, out.Attachments[i])
-			if err != nil {
-				r.log.Error("failed to fetch media from url", "url", out.Attachments[i].URL, "err", err)
-				continue
-			}
-			out.Attachments[i].MediaKey = key
-
-			// Восстанавливаем имя файла из ключа (формат: "timestamp_filename.ext")
-			if out.Attachments[i].FileName == "" || out.Attachments[i].FileName == "file" {
-				parts := strings.SplitN(key, "_", 2)
-				if len(parts) == 2 {
-					out.Attachments[i].FileName = parts[1]
-				}
-			}
-		}
-	}
-
-	// Помечаем как созданное мостом — защита от эхо.
 	out.MarkFromBridge()
 
-	// Если не удалось передать reply — добавляем имя отправителя в текст.
 	if msg.SenderName != "" {
 		out.Text = fmt.Sprintf("%s:\n%s", msg.SenderName, msg.Text)
 	}
