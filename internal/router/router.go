@@ -142,7 +142,25 @@ func (r *Router) findTargetAdapter(route Route, targetChat domain.ChatID) (domai
 	return nil, domain.ChatID{}
 }
 
+// fetchPendingMedia скачивает вложения, если у них есть URL, но нет MediaKey.
+// Это нужно для сообщений из MAX, где приходят ссылки, а не готовые файлы.
+func (r *Router) fetchPendingMedia(ctx context.Context, msg *domain.Message) {
+	for i := range msg.Attachments {
+		if msg.Attachments[i].MediaKey == "" && msg.Attachments[i].URL != "" {
+			key, err := r.media.Fetch(ctx, msg.Attachments[i])
+			if err != nil {
+				r.log.Error("failed to fetch media from url", "url", msg.Attachments[i].URL, "err", err)
+				continue
+			}
+			msg.Attachments[i].MediaKey = key
+		}
+	}
+}
+
 func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Route) {
+	// 1. Скачиваем новые вложения (если они пришли по URL)
+	r.fetchPendingMedia(ctx, msg)
+
 	links, _ := r.store.LookupTargets(ctx, msg.Ref)
 
 	// Если это было целью (target), обновляем оригинал (source)
@@ -252,20 +270,7 @@ func (r *Router) deliver(ctx context.Context, msg *domain.Message, route Route, 
 	}
 
 	// 2. ЛЕНИВАЯ ЗАГРУЗКА МЕДИА
-	// Если в сообщении есть нескачанные вложения (заглушки),
-	// просим исходный адаптер их скачать.
-	if len(msg.Attachments) > 0 && msg.Attachments[0].Type == "pending" {
-		srcAdapter, ok := r.adapters[msg.AdapterName]
-		if ok {
-			if fetcher, ok := srcAdapter.(domain.MediaFetcher); ok {
-				if err := fetcher.FetchMedia(ctx, msg); err != nil {
-					r.log.Error("failed to fetch media", "err", err)
-					// Если не смогли скачать — шлём хотя бы текст
-					msg.Attachments = nil
-				}
-			}
-		}
-	}
+	r.fetchPendingMedia(ctx, msg)
 
 	// 3. Ждём, пока можно будет отправить в этот чат (Rate Limit)
 	if err := r.limiter.Wait(ctx, target.Chat); err != nil {
