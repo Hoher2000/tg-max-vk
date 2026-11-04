@@ -345,8 +345,13 @@ func (c *Client) editMessage(ctx context.Context, messageID string, text string)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("max edit failed %d: %s", resp.StatusCode, string(respBody))
+		var apiResp SuccessResponse
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		_ = json.Unmarshal(bodyBytes, &apiResp)
+		if !apiResp.Success {
+			return fmt.Errorf("max api returned success=false: %s", string(bodyBytes))
+		}
+		return fmt.Errorf("max edit failed %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 	return nil
 }
@@ -367,8 +372,13 @@ func (c *Client) deleteMessage(ctx context.Context, messageID string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("max delete failed %d: %s", resp.StatusCode, string(respBody))
+		var apiResp SuccessResponse
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		_ = json.Unmarshal(bodyBytes, &apiResp)
+		if !apiResp.Success {
+			return fmt.Errorf("max api returned success=false: %s", string(bodyBytes))
+		}
+		return fmt.Errorf("max edit failed %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 	return nil
 }

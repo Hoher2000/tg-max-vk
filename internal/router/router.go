@@ -232,6 +232,20 @@ func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Rout
 }
 
 func (r *Router) handleDelete(ctx context.Context, msg *domain.Message, route Route) {
+	// Если ChatID пустой (удаление в личке TG), ищем просто по ID сообщения
+	if msg.Ref.Chat.ID() == "" {
+		links, err := r.store.LookupTargets(ctx, msg.Ref) // LookupTargets уже умеет искать по одному ID
+		if err == nil {
+			for _, link := range links {
+				if targetAdapter, _ := r.findTargetAdapter(route, link.Target.Chat); targetAdapter != nil {
+					if deleter, ok := targetAdapter.(domain.Deleter); ok {
+						_ = deleter.Delete(ctx, link.Target)
+					}
+				}
+			}
+		}
+		return
+	}
 	links, err := r.store.LookupTargets(ctx, msg.Ref)
 	if err != nil {
 		r.log.Error("failed to lookup targets for delete", "err", err)
@@ -285,8 +299,21 @@ func (r *Router) deliver(ctx context.Context, msg *domain.Message, route Route, 
 		return fmt.Errorf("adapter %q not registered", target.Adapter)
 	}
 
-	// 2. ЛЕНИВАЯ ЗАГРУЗКА МЕДИА
-	r.fetchPendingMedia(ctx, msg)
+	// --- СКАЧИВАЕМ МЕДИА, ЕСЛИ ОНО ЕСТЬ ---
+	if len(msg.Attachments) > 0 {
+		// 1. Если есть URL (из MAX) — качаем через MediaStore
+		r.fetchPendingMedia(ctx, msg)
+
+		// 2. Если есть pending (из Telegram) — просим адаптер скачать
+		if msg.Attachments[0].Type == "pending" {
+			if fetcher, ok := r.adapters[msg.AdapterName].(domain.MediaFetcher); ok {
+				if err := fetcher.FetchMedia(ctx, msg); err != nil {
+					r.log.Error("failed to fetch media", "err", err)
+					msg.Attachments = nil // Шлем хотя бы текст
+				}
+			}
+		}
+	}
 
 	// 3. Ждём, пока можно будет отправить в этот чат (Rate Limit)
 	if err := r.limiter.Wait(ctx, target.Chat); err != nil {
@@ -357,13 +384,17 @@ func (r *Router) prepareOutgoing(msg *domain.Message, target Target) *domain.Mes
 		Attachments: msg.Attachments,
 		Timestamp:   msg.Timestamp,
 	}
-
 	out.MarkFromBridge()
 
-	if msg.SenderName != "" {
-		out.Text = fmt.Sprintf("%s:\n%s", msg.SenderName, msg.Text)
+	// Добавляем невидимый маркер (Zero-Width Space) в конец текста
+	// Если платформа пришлет его обратно, мы поймем, что это наше сообщение
+	if out.Text != "" {
+		out.Text += "\u200B"
 	}
 
+	if msg.SenderName != "" {
+		out.Text = fmt.Sprintf("%s:\n%s", msg.SenderName, out.Text)
+	}
 	return out
 }
 

@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // AttachmentType — тип вложения.
 type AttachmentType string
@@ -65,11 +68,13 @@ func (m *Message) HasAttachments() bool {
 // IsFromBridge проверяет, что сообщение уже было переслано мостом.
 // Защищает от эхо-циклов.
 func (m *Message) IsFromBridge() bool {
-	if m.Meta == nil {
-		return false
+	if m.Meta != nil {
+		if v, _ := m.Meta["from_bridge"].(bool); v {
+			return true
+		}
 	}
-	v, _ := m.Meta["from_bridge"].(bool)
-	return v
+	// Проверяем наличие маркера в тексте
+	return strings.HasSuffix(m.Text, "\u200B")
 }
 
 // MarkFromBridge помечает сообщение как созданное мостом.

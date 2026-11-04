@@ -104,3 +104,7 @@ type UploadResponse struct {
 type MediaPayload struct {
 	Token string `json:"token"`
 }
+
+type SuccessResponse struct {
+	Success bool `json:"success"`
+}
