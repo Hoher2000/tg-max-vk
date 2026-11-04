@@ -96,6 +96,13 @@ func (r *Router) handle(ctx context.Context, msg *domain.Message) {
 
 	var matched bool
 	for _, route := range r.routes {
+		// Для удаления без ChatID пропускаем проверку matches
+		if action != domain.ActionDelete && !route.matches(msg) {
+			continue
+		}
+		if action == domain.ActionDelete && msg.Ref.Chat.ID() != "" && !route.matches(msg) {
+			continue
+		}
 		if !route.matches(msg) {
 			continue
 		}
@@ -160,7 +167,15 @@ func (r *Router) fetchPendingMedia(ctx context.Context, msg *domain.Message) {
 
 func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Route) {
 	r.fetchPendingMedia(ctx, msg)
-
+	// Скачиваем pending-медиа (из Telegram) для редактирования
+	if len(msg.Attachments) > 0 && msg.Attachments[0].Type == "pending" {
+		if fetcher, ok := r.adapters[msg.AdapterName].(domain.MediaFetcher); ok {
+			if err := fetcher.FetchMedia(ctx, msg); err != nil {
+				r.log.Error("failed to fetch pending media for edit", "err", err)
+				msg.Attachments = nil
+			}
+		}
+	}
 	links, err := r.store.LookupTargets(ctx, msg.Ref)
 	if err != nil {
 		r.log.Error("failed to lookup targets for edit", "err", err)
