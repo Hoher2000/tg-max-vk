@@ -239,11 +239,11 @@ func (a *Adapter) onNewMessage(out chan<- *domain.Message) tg.NewMessageHandler 
 			}
 		}
 
-		a.log.Debug("personal message received",
+		/*a.log.Debug("personal message received",
 			"chat", chatID.String(),
 			"msg_id", msg.ID,
 			"text", msg.Message,
-		)
+		)*/
 
 		select {
 		case <-ctx.Done():
@@ -279,11 +279,11 @@ func (a *Adapter) onNewChannelMessage(out chan<- *domain.Message) tg.NewChannelM
 			return nil
 		}
 
-		a.log.Debug("channel message received",
+		/*a.log.Debug("channel message received",
 			"chat", chatID.String(),
 			"msg_id", msg.ID,
 			"text", msg.Message,
-		)
+		)*/
 
 		coreMsg := &domain.Message{
 			Ref: domain.MessageRef{

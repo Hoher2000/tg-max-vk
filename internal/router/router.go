@@ -77,18 +77,10 @@ func (r *Router) Run(ctx context.Context) error {
 
 // handle обрабатывает одно входящее сообщение.
 func (r *Router) handle(ctx context.Context, msg *domain.Message) {
-	// 1. Защита от эхо-циклов.
 	if msg.IsFromBridge() {
-		r.log.Debug("skip bridge-originated message",
-			"adapter", msg.AdapterName,
-			"chat", msg.Ref.Chat.String(),
-			"msg_id", msg.Ref.ID,
-		)
 		return
 	}
 
-	// 2. Ищем подходящие маршруты.
-	// По умолчанию считаем, что это создание
 	action := msg.Action
 	if action == "" {
 		action = domain.ActionCreate
@@ -96,19 +88,26 @@ func (r *Router) handle(ctx context.Context, msg *domain.Message) {
 
 	var matched bool
 	for _, route := range r.routes {
-		// Для удаления без ChatID пропускаем проверку matches
 		if action != domain.ActionDelete && !route.matches(msg) {
 			continue
 		}
 		if action == domain.ActionDelete && msg.Ref.Chat.ID() != "" && !route.matches(msg) {
 			continue
 		}
-		if !route.matches(msg) {
-			continue
-		}
-		matched = true
 
-		switch action { // используем локальную action
+		// Логируем получение ТОЛЬКО если сообщение подошло под маршрут
+		if !matched {
+			r.log.Debug("message matched route",
+				"route", route.ID,
+				"adapter", msg.AdapterName,
+				"chat", msg.Ref.Chat.String(),
+				"msg_id", msg.Ref.ID,
+				"action", action,
+			)
+			matched = true
+		}
+
+		switch action {
 		case domain.ActionCreate:
 			r.forward(ctx, msg, route)
 		case domain.ActionEdit:
@@ -118,12 +117,7 @@ func (r *Router) handle(ctx context.Context, msg *domain.Message) {
 		}
 	}
 
-	if !matched {
-		r.log.Debug("no matching routes",
-			"adapter", msg.AdapterName,
-			"chat", msg.Ref.Chat.String(),
-		)
-	}
+	// Убрали лог "no matching routes", чтобы не засорять консоль
 }
 
 // forward пересылает сообщение по одному маршруту во все цели.
