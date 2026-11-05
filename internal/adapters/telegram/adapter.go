@@ -745,15 +745,10 @@ func (a *Adapter) handleEditMsg(ctx context.Context, msg *tg.Message, out chan<-
 		Meta:        make(map[string]any),
 	}
 
-	// Если в отредактированном сообщении есть медиа, нам нужно его скачать!
+	// ВАЖНО: не скачиваем медиа здесь!
+	// Просто ставим заглушку, чтобы роутер знал, что оно есть.
 	if msg.Media != nil {
-		// Скачиваем медиа, если оно есть (используя твою функцию downloadMedia)
-		atts, err := a.downloadMedia(ctx, chatID, msg.ID)
-		if err == nil {
-			coreMsg.Attachments = atts
-		} else {
-			a.log.Error("failed to download media on edit", "err", err)
-		}
+		coreMsg.Attachments = []domain.Attachment{{Type: "pending"}}
 	}
 
 	select {

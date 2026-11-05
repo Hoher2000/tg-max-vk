@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	"github.com/Hoher2000/tg-max-vk/internal/domain"
 	"github.com/Hoher2000/tg-max-vk/internal/ratelimit"
+	"github.com/gotd/td/tgerr"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -160,83 +160,108 @@ func (r *Router) fetchPendingMedia(ctx context.Context, msg *domain.Message) {
 }
 
 func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Route) {
+	// 1. Скачиваем новые вложения (если они пришли по URL)
 	r.fetchPendingMedia(ctx, msg)
-	// Скачиваем pending-медиа (из Telegram) для редактирования
+
+	// 2. Скачиваем pending-медиа (если пришло из TG)
 	if len(msg.Attachments) > 0 && msg.Attachments[0].Type == "pending" {
 		if fetcher, ok := r.adapters[msg.AdapterName].(domain.MediaFetcher); ok {
 			if err := fetcher.FetchMedia(ctx, msg); err != nil {
 				r.log.Error("failed to fetch pending media for edit", "err", err)
-				msg.Attachments = nil
+				msg.Attachments = nil // Отправляем хотя бы текст
 			}
 		}
 	}
+
 	links, err := r.store.LookupTargets(ctx, msg.Ref)
 	if err != nil {
 		r.log.Error("failed to lookup targets for edit", "err", err)
 		return
 	}
 
+	// Если сообщение — это ЦЕЛЬ (target), обновляем ИСТОЧНИК (source)
 	if len(links) == 0 {
 		srcLink, err := r.store.LookupSource(ctx, msg.Ref)
-		if err != nil {
-			if !errors.Is(err, domain.ErrNotFound) {
-				r.log.Error("failed to lookup source for edit", "err", err)
-			}
-			return
-		}
-		if srcLink != nil {
+		if err == nil && srcLink != nil {
 			sourceAdapter, _ := r.findTargetAdapter(route, srcLink.Source.Chat)
 			if sourceAdapter != nil {
-				if len(msg.Attachments) > 0 {
-					if mediaEditor, ok := sourceAdapter.(domain.MediaEditor); ok {
-						if err := mediaEditor.EditMedia(ctx, srcLink.Source, msg); err != nil {
-							r.log.Error("failed to edit media (source)", "adapter", sourceAdapter.Name(), "err", err)
-						} else {
-							r.log.Info("message media edited (source)", "chat", srcLink.Source.Chat.String(), "msg_id", srcLink.Source.ID)
-						}
-						return
-					}
-				}
-				if editor, ok := sourceAdapter.(domain.Editor); ok {
-					if err := editor.Edit(ctx, srcLink.Source, msg.Text); err != nil {
-						if !strings.Contains(err.Error(), "MESSAGE_NOT_MODIFIED") {
-							r.log.Error("failed to edit text (source)", "adapter", sourceAdapter.Name(), "err", err)
-						}
-					} else {
-						r.log.Info("message edited (source)", "chat", srcLink.Source.Chat.String(), "msg_id", srcLink.Source.ID)
-					}
-				}
+				r.processEditForTarget(ctx, sourceAdapter, srcLink.Source, msg)
 			}
 		}
 		return
 	}
 
+	// Если сообщение — ИСТОЧНИК (source), обновляем все ЦЕЛИ (targets)
 	for _, link := range links {
 		targetAdapter, _ := r.findTargetAdapter(route, link.Target.Chat)
 		if targetAdapter == nil {
 			continue
 		}
+		r.processEditForTarget(ctx, targetAdapter, link.Target, msg)
+	}
+}
 
-		if len(msg.Attachments) > 0 {
-			if mediaEditor, ok := targetAdapter.(domain.MediaEditor); ok {
-				if err := mediaEditor.EditMedia(ctx, link.Target, msg); err != nil {
-					r.log.Error("failed to edit media (target)", "adapter", targetAdapter.Name(), "err", err)
-				} else {
-					r.log.Info("message media edited (target)", "chat", link.Target.Chat.String(), "msg_id", link.Target.ID)
-				}
-				continue
-			}
-		}
-
-		if editor, ok := targetAdapter.(domain.Editor); ok {
-			if err := editor.Edit(ctx, link.Target, msg.Text); err != nil {
-				if !strings.Contains(err.Error(), "MESSAGE_NOT_MODIFIED") {
-					r.log.Error("failed to edit text (target)", "adapter", targetAdapter.Name(), "err", err)
-				}
+// processEditForTarget применяет изменения к конкретному адаптеру и сообщению.
+func (r *Router) processEditForTarget(ctx context.Context, adapter domain.Adapter, targetRef domain.MessageRef, msg *domain.Message) {
+	// 1. Если есть вложения — пробуем EditMedia (обновление на месте)
+	if len(msg.Attachments) > 0 {
+		if mediaEditor, ok := adapter.(domain.MediaEditor); ok {
+			if err := mediaEditor.EditMedia(ctx, targetRef, msg); err != nil {
+				r.log.Error("failed to edit media in-place", "adapter", adapter.Name(), "err", err)
 			} else {
-				r.log.Info("message edited (target)", "chat", link.Target.Chat.String(), "msg_id", link.Target.ID)
+				r.log.Info("message media edited", "chat", targetRef.Chat.String(), "msg_id", targetRef.ID)
 			}
+			return
 		}
+	}
+
+	// 2. Если вложений нет — обновляем текст
+	editor, ok := adapter.(domain.Editor)
+	if !ok {
+		r.log.Warn("adapter doesn't support edit", "adapter", adapter.Name())
+		return
+	}
+
+	err := editor.Edit(ctx, targetRef, msg.Text)
+	if err != nil {
+		// 3. Если текст не изменился, значит в источнике удалили картинку.
+		// Telegram не умеет удалять медиа, поэтому удаляем сообщение и шлем новое.
+		if tgerr.Is(err, "MESSAGE_NOT_MODIFIED") {
+			r.log.Info("media removed in source, recreating message", "msg_id", targetRef.ID)
+
+			// Удаляем старое сообщение
+			if deleter, ok := adapter.(domain.Deleter); ok {
+				if err := deleter.Delete(ctx, targetRef); err != nil {
+					r.log.Warn("failed to delete old message before recreate", "err", err)
+				}
+			}
+
+			// Отправляем новое (только текст)
+			out := r.prepareOutgoing(msg, Target{Adapter: adapter.Name(), Chat: targetRef.Chat})
+			newRef, sendErr := adapter.Send(ctx, out)
+
+			if sendErr != nil {
+				r.log.Error("failed to resend message after media removal", "err", sendErr)
+				return
+			}
+
+			// 4. ОБНОВЛЯЕМ БД! Записываем новый ID, чтобы следующие правки шли в него.
+			newLink := domain.MessageLink{
+				Source: msg.Ref,
+				Target: newRef,
+			}
+			if err := r.store.SaveLink(ctx, newLink); err != nil {
+				r.log.Error("failed to save new link after media removal", "err", err)
+			} else {
+				r.log.Info("message recreated (media removed)", "chat", newRef.Chat.String(), "msg_id", newRef.ID)
+			}
+			return
+		}
+
+		// Если это какая-то другая ошибка
+		r.log.Error("failed to edit message", "adapter", adapter.Name(), "err", err)
+	} else {
+		r.log.Info("message edited", "chat", targetRef.Chat.String(), "msg_id", targetRef.ID)
 	}
 }
 
