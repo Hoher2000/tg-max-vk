@@ -17,6 +17,7 @@ import (
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/message/styling"
 	"github.com/gotd/td/telegram/message/unpack"
+	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 
@@ -122,6 +123,7 @@ func (a *Adapter) Start(ctx context.Context, out chan<- *domain.Message) error {
 			}
 
 			a.api = a.client.API()
+			a.peersMgr = peers.Options{}.Build(a.api)
 			a.sender = message.NewSender(a.api)
 			close(a.ready)
 			a.log.Info("telegram adapter ready",
