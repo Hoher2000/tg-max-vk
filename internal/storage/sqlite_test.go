@@ -169,3 +169,28 @@ func TestMultipleTargets(t *testing.T) {
 		t.Fatalf("expected 2 links, got %d", len(links))
 	}
 }
+
+func TestLookupSourceHasMedia(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	srcChat := mustChat(t, domain.PlatformTelegram, domain.ChatKindChannel, "-1001")
+	dstChat := mustChat(t, domain.PlatformMax, domain.ChatKindChannel, "42")
+
+	src := domain.MessageRef{Chat: srcChat, ID: "100"}
+	dst := domain.MessageRef{Chat: dstChat, ID: "200"}
+
+	if err := s.SaveLink(ctx, domain.MessageLink{
+		Source: src, Target: dst, HasMedia: true,
+	}); err != nil {
+		t.Fatalf("SaveLink: %v", err)
+	}
+
+	link, err := s.LookupSource(ctx, dst)
+	if err != nil {
+		t.Fatalf("LookupSource: %v", err)
+	}
+	if !link.HasMedia {
+		t.Errorf("LookupSource should return HasMedia=true")
+	}
+}

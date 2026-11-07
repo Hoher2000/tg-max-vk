@@ -175,7 +175,7 @@ func TestTwoWayBridge_Integration(t *testing.T) {
 	}
 	r.handle(ctx, msgTgEdit)
 
-	if maxMock.messages["max-msg-1"].Text != "Привет, отредактированный в TG\u200B" {
+	if maxMock.messages["max-msg-1"].Text != "Привет, отредактированный в TG" {
 		t.Errorf("MAX text not updated, got %q", maxMock.messages["max-msg-1"].Text)
 	}
 

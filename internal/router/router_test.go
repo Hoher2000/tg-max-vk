@@ -389,7 +389,7 @@ func TestForwardReply(t *testing.T) {
 	if max.SentCount() != 1 {
 		t.Fatalf("want 1 send, got %d", max.SentCount())
 	}
-	if max.sent[0].Text != "reply text\u200b" {
+	if max.sent[0].Text != "reply text" {
 		t.Errorf("text mismatch: %q", max.sent[0].Text)
 	}
 }
@@ -431,8 +431,8 @@ func TestForwardReplyFallsBackWhenNoLink(t *testing.T) {
 		t.Fatalf("want 1 send (fallback), got %d", max.SentCount())
 	}
 	// Fallback должен добавить имя отправителя в текст.
-	if got := max.sent[0].Text; got != "Вася:\nreply text\u200b" {
-		t.Errorf("fallback text: want %q, got %q", "Вася:\nreply text\u200b", got)
+	if got := max.sent[0].Text; got != "Вася:\nreply text" {
+		t.Errorf("fallback text: want %q, got %q", "Вася:\nreply text", got)
 	}
 }
 

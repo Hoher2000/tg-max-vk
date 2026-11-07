@@ -1,7 +1,6 @@
 package domain
 
 import (
-	"strings"
 	"time"
 )
 
@@ -69,13 +68,11 @@ func (m *Message) HasAttachments() bool {
 // IsFromBridge проверяет, что сообщение уже было переслано мостом.
 // Защищает от эхо-циклов.
 func (m *Message) IsFromBridge() bool {
-	if m.Meta != nil {
-		if v, _ := m.Meta["from_bridge"].(bool); v {
-			return true
-		}
+	if m.Meta == nil {
+		return false
 	}
-	// Проверяем наличие маркера в тексте
-	return strings.HasSuffix(m.Text, "\u200B")
+	v, _ := m.Meta["from_bridge"].(bool)
+	return v
 }
 
 // MarkFromBridge помечает сообщение как созданное мостом.

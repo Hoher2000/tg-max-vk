@@ -80,6 +80,17 @@ func (r *Router) handle(ctx context.Context, msg *domain.Message) {
 		return
 	}
 
+	// Защита от эха: если это Create, проверяем, не наше ли это сообщение
+	if msg.Action == "" || msg.Action == domain.ActionCreate {
+		if srcLink, err := r.store.LookupSource(ctx, msg.Ref); err == nil && srcLink != nil {
+			r.log.Debug("skip bridge-created message (echo)",
+				"chat", msg.Ref.Chat.String(),
+				"msg_id", msg.Ref.ID,
+			)
+			return
+		}
+	}
+
 	action := msg.Action
 	if action == "" {
 		action = domain.ActionCreate
@@ -161,6 +172,12 @@ func (r *Router) fetchPendingMedia(ctx context.Context, msg *domain.Message) {
 }
 
 func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Route) {
+	r.log.Debug("handleEdit received",
+		"ref", msg.Ref.Chat.String()+":"+msg.Ref.ID,
+		"text_len", len(msg.Text),
+		"attachments", len(msg.Attachments),
+		"media_removed", msg.MediaRemoved,
+	)
 	// 1. Скачиваем новые вложения (если они пришли по URL)
 	r.fetchPendingMedia(ctx, msg)
 
@@ -202,6 +219,12 @@ func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Rout
 
 // processEditForTarget применяет изменения к конкретному адаптеру и сообщению.
 func (r *Router) processEditForTarget(ctx context.Context, adapter domain.Adapter, ref domain.MessageRef, msg *domain.Message, link domain.MessageLink) {
+	r.log.Debug("processEditForTarget",
+		"ref", ref.Chat.String()+":"+ref.ID,
+		"link.HasMedia", link.HasMedia,
+		"msg.MediaRemoved", msg.MediaRemoved,
+		"msg.Attachments", len(msg.Attachments),
+	)
 	// 1. Если медиа явно УДАЛЕНО
 	if msg.MediaRemoved {
 		if link.HasMedia {
@@ -427,17 +450,12 @@ func (r *Router) prepareOutgoing(msg *domain.Message, target Target) *domain.Mes
 	out := &domain.Message{
 		Ref:         domain.MessageRef{Chat: target.Chat},
 		AdapterName: target.Adapter,
-		Text:        msg.Text,
+		Text:        msg.Text, // БЕЗ \u200B
 		Attachments: msg.Attachments,
 		Timestamp:   msg.Timestamp,
 	}
 	out.MarkFromBridge()
-
-	// Добавляем невидимый маркер (Zero-Width Space) в конец текста
-	// Если платформа пришлет его обратно, мы поймем, что это наше сообщение
-	if out.Text != "" {
-		out.Text += "\u200B"
-	}
+	// УДАЛИТЬ блок с out.Text += "\u200B"
 
 	if msg.SenderName != "" {
 		out.Text = fmt.Sprintf("%s:\n%s", msg.SenderName, out.Text)

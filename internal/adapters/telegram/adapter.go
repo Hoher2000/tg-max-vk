@@ -808,11 +808,12 @@ func (a *Adapter) handleEditMsg(ctx context.Context, msg *tg.Message, out chan<-
 		}
 	}
 
-	if hasMedia {
-		coreMsg.Attachments = []domain.Attachment{{Type: "pending"}}
-	} else {
+	// Если медиа реально удалено, ставим флаг
+	if !hasMedia {
 		coreMsg.MediaRemoved = true
 	}
+	// Если медиа есть, мы НЕ ставим pending.
+	// Роутер просто обновит текст, не трогая медиа.
 
 	select {
 	case <-ctx.Done():

@@ -181,7 +181,14 @@ func (a *Adapter) convertUpdate(u Update) *domain.Message {
 			case "chat":
 				chatKind = domain.ChatKindGroup
 			default:
-				chatKind = domain.ChatKindGroup
+				// Fallback: в MAX ID каналов отрицательные, групп — тоже отрицательные,
+				// но для нашего моста лучше считать всё, что не "chat", каналом.
+				// Если когда-нибудь будут группы — добавим отдельную проверку.
+				if msg.Recipient.ChatID < 0 {
+					chatKind = domain.ChatKindChannel
+				} else {
+					chatKind = domain.ChatKindGroup
+				}
 			}
 		} else if msg.Recipient.UserID != 0 {
 			chatID = msg.Recipient.UserID
@@ -215,33 +222,36 @@ func (a *Adapter) convertUpdate(u Update) *domain.Message {
 		Meta:        make(map[string]any),
 	}
 
-	if len(msg.Body.Attachments) > 0 { // Парсим вложения
-		for _, att := range msg.Body.Attachments {
-			attType := domain.AttachmentDocument
-			switch att.Type {
-			case "image":
-				attType = domain.AttachmentPhoto
-			case "video":
-				attType = domain.AttachmentVideo
-			}
+	// Парсим вложения
+	for _, att := range msg.Body.Attachments {
+		attType := domain.AttachmentDocument
+		switch att.Type {
+		case "image":
+			attType = domain.AttachmentPhoto
+		case "video":
+			attType = domain.AttachmentVideo
+		}
 
-			var fileURL string
-			if payloadMap, ok := att.Payload.(map[string]any); ok {
-				if u, ok := payloadMap["url"].(string); ok {
-					fileURL = u
-				}
-			}
-
-			if fileURL != "" {
-				out.Attachments = append(out.Attachments, domain.Attachment{
-					Type: attType,
-					URL:  fileURL,
-				})
-			} else {
-				a.log.Debug("attachment without URL", "type", att.Type)
+		var fileURL string
+		if payloadMap, ok := att.Payload.(map[string]any); ok {
+			if u, ok := payloadMap["url"].(string); ok {
+				fileURL = u
 			}
 		}
-	} else {
+
+		if fileURL != "" {
+			out.Attachments = append(out.Attachments, domain.Attachment{
+				Type: attType,
+				URL:  fileURL,
+			})
+		} else {
+			a.log.Debug("attachment without URL", "type", att.Type)
+		}
+	}
+
+	// ВАЖНО: если после парсинга вложений нет (даже если массив был не пустой),
+	// значит медиа удалено или не распознано. Ставим флаг!
+	if len(out.Attachments) == 0 {
 		out.MediaRemoved = true
 	}
 
@@ -260,7 +270,14 @@ func (a *Adapter) convertUpdate(u Update) *domain.Message {
 			ID:   msg.Link.Body.Mid,
 		}
 	}
-
+	a.log.Debug("max update parsed",
+		"action", out.Action,
+		"text_len", len(out.Text),
+		"raw_attachments", len(msg.Body.Attachments),
+		"parsed_attachments", len(out.Attachments),
+		"media_removed", out.MediaRemoved,
+		"chat", out.Ref.Chat.String(),
+	)
 	return out
 }
 
@@ -361,9 +378,10 @@ func (a *Adapter) prepareAttachments(ctx context.Context, msg *domain.Message) *
 		}
 
 		attType := "image"
-		if att.Type == domain.AttachmentVideo {
+		switch att.Type {
+		case domain.AttachmentVideo:
 			attType = "video"
-		} else if att.Type == domain.AttachmentDocument {
+		case domain.AttachmentDocument:
 			attType = "file"
 		}
 
