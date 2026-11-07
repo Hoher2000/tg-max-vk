@@ -143,6 +143,36 @@ func (m *mockMediaStore) Save(ctx context.Context, r io.Reader, filename string)
 	return "mock-key", nil
 }
 
+func (m *mockStore) DeleteLink(ctx context.Context, link domain.MessageLink) error {
+	if m.err != nil {
+		return m.err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, l := range m.links {
+		if l == link {
+			m.links = append(m.links[:i], m.links[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+func (m *mockStore) MoveLink(ctx context.Context, oldLink, newLink domain.MessageLink) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Удаляем старую
+	for i, l := range m.links {
+		if l.Source.Chat.Equal(oldLink.Source.Chat) && l.Source.ID == oldLink.Source.ID &&
+			l.Target.Chat.Equal(oldLink.Target.Chat) {
+			m.links = append(m.links[:i], m.links[i+1:]...)
+			break
+		}
+	}
+	m.links = append(m.links, newLink)
+	return nil
+}
+
 // ---------- Helpers ----------
 
 // newTestLimiter создаёт rate limiter с очень щедрыми лимитами,

@@ -175,8 +175,8 @@ func TestTwoWayBridge_Integration(t *testing.T) {
 	}
 	r.handle(ctx, msgTgEdit)
 
-	if maxMock.messages["max-msg-1"].Text != "Привет, отредактированный в TG" {
-		t.Errorf("MAX text not updated, got %s", maxMock.messages["max-msg-1"].Text)
+	if maxMock.messages["max-msg-1"].Text != "Привет, отредактированный в TG\u200B" {
+		t.Errorf("MAX text not updated, got %q", maxMock.messages["max-msg-1"].Text)
 	}
 
 	// ==========================================
@@ -209,6 +209,102 @@ func TestTwoWayBridge_Integration(t *testing.T) {
 
 	if _, ok := maxMock.messages["max-msg-1"]; ok {
 		t.Error("message in MAX should be deleted")
+	}
+}
+
+func TestMediaAddRemoveAdd(t *testing.T) {
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := storage.NewSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if _, err := storage.Migrate(ctx, db.DB(), log); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	store := storage.NewSQLiteStoreFromDB(db.DB())
+	defer store.Close()
+
+	limiter := ratelimit.NewManager(map[domain.Platform]ratelimit.Limits{
+		domain.PlatformTelegram: {Global: 1000, GlobalBurst: 1000, PerChat: 1000, PerChatBurst: 1000, IdleTimeout: time.Minute},
+		domain.PlatformMax:      {Global: 1000, GlobalBurst: 1000, PerChat: 1000, PerChatBurst: 1000, IdleTimeout: time.Minute},
+	}, log)
+	defer limiter.Stop()
+
+	tgMock := NewMockAdapter("telegram_main", domain.PlatformTelegram)
+	maxMock := NewMockAdapter("max_main", domain.PlatformMax)
+
+	adapters := map[string]domain.Adapter{
+		"telegram_main": tgMock,
+		"max_main":      maxMock,
+	}
+
+	maxChat := mustChat(t, domain.PlatformMax, domain.ChatKindChannel, "-100")
+	tgChat := mustChat(t, domain.PlatformTelegram, domain.ChatKindChannel, "-200")
+
+	routes := []Route{
+		{ID: "m2t", FromAdapter: "max_main", FromChat: maxChat, Targets: []Target{{Adapter: "telegram_main", Chat: tgChat}}, Options: RouteOptions{ForwardAttachments: true}},
+	}
+
+	r := New(adapters, routes, store, &MockMediaStore{}, limiter, log)
+	maxMock.messages["max.1"] = &domain.Message{Text: "Привет"}
+
+	// Шаг 1: создать с медиа
+	r.handle(ctx, &domain.Message{
+		Ref:         domain.MessageRef{Chat: maxChat, ID: "max.1"},
+		Action:      domain.ActionCreate,
+		AdapterName: "max_main",
+		Text:        "Привет",
+		Attachments: []domain.Attachment{{Type: domain.AttachmentPhoto, MediaKey: "photo-1"}},
+	})
+	links, _ := store.LookupTargets(ctx, domain.MessageRef{Chat: maxChat, ID: "max.1"})
+	if len(links) != 1 {
+		t.Fatalf("after create: expected 1 link, got %d", len(links))
+	}
+	if !links[0].HasMedia {
+		t.Fatalf("after create: HasMedia should be true")
+	}
+	oldTGID := links[0].Target.ID
+
+	// Шаг 2: удалить медиа
+	r.handle(ctx, &domain.Message{
+		Ref:          domain.MessageRef{Chat: maxChat, ID: "max.1"},
+		Action:       domain.ActionEdit,
+		AdapterName:  "max_main",
+		Text:         "Привет",
+		MediaRemoved: true,
+	})
+	links, _ = store.LookupTargets(ctx, domain.MessageRef{Chat: maxChat, ID: "max.1"})
+	if len(links) != 1 {
+		t.Fatalf("after remove: expected 1 link, got %d", len(links))
+	}
+	if links[0].HasMedia {
+		t.Fatalf("after remove: HasMedia should be false")
+	}
+	if links[0].Target.ID == oldTGID {
+		t.Fatalf("after remove: TG message should be recreated with new ID, old=%s new=%s", oldTGID, links[0].Target.ID)
+	}
+	newTGID := links[0].Target.ID
+
+	// Шаг 3: снова добавить медиа
+	r.handle(ctx, &domain.Message{
+		Ref:         domain.MessageRef{Chat: maxChat, ID: "max.1"},
+		Action:      domain.ActionEdit,
+		AdapterName: "max_main",
+		Text:        "Привет снова",
+		Attachments: []domain.Attachment{{Type: domain.AttachmentPhoto, MediaKey: "photo-2"}},
+	})
+	links, _ = store.LookupTargets(ctx, domain.MessageRef{Chat: maxChat, ID: "max.1"})
+	if len(links) != 1 {
+		t.Fatalf("after re-add: expected 1 link, got %d", len(links))
+	}
+	if !links[0].HasMedia {
+		t.Fatalf("after re-add: HasMedia should be true")
+	}
+	if links[0].Target.ID != newTGID {
+		t.Errorf("after re-add: TG message ID should stay %s, got %s", newTGID, links[0].Target.ID)
 	}
 }
 

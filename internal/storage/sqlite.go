@@ -57,7 +57,6 @@ func NewSQLite(path string) (*SQLiteStore, error) {
 func (s *SQLiteStore) DB() *sql.DB { return s.db }
 
 func (s *SQLiteStore) SaveLink(ctx context.Context, link domain.MessageLink) error {
-	// Защита от битых записей
 	if link.Source.Chat.ID() == "" || link.Target.Chat.ID() == "" {
 		return fmt.Errorf("cannot save link: source or target chat ID is empty")
 	}
@@ -65,14 +64,17 @@ func (s *SQLiteStore) SaveLink(ctx context.Context, link domain.MessageLink) err
 	const q = `
 		INSERT INTO message_links (
 			source_platform, source_chat, source_message_id,
-			target_platform, target_chat, target_message_id
-		) VALUES (?, ?, ?, ?, ?, ?)
+			target_platform, target_chat, target_message_id, has_media
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(source_platform, source_chat, source_message_id, target_platform, target_chat)
-		DO UPDATE SET target_message_id = excluded.target_message_id
+		DO UPDATE SET 
+			target_message_id = excluded.target_message_id,
+			has_media = excluded.has_media
 	`
 	_, err := s.db.ExecContext(ctx, q,
 		string(link.Source.Chat.Platform()), link.Source.Chat.String(), link.Source.ID,
 		string(link.Target.Chat.Platform()), link.Target.Chat.String(), link.Target.ID,
+		link.HasMedia, // <--- ДОБАВЛЕНО ЗДЕСЬ
 	)
 	if err != nil {
 		return fmt.Errorf("save link: %w", err)
@@ -88,14 +90,14 @@ func (s *SQLiteStore) LookupTargets(ctx context.Context, src domain.MessageRef) 
 
 	if src.Chat.ID() != "" {
 		const q = `
-			SELECT target_platform, target_chat, target_message_id
+			SELECT target_platform, target_chat, target_message_id, has_media
 			FROM message_links
 			WHERE source_platform = ? AND source_chat = ? AND source_message_id = ?
 		`
 		rows, err = s.db.QueryContext(ctx, q, string(src.Chat.Platform()), src.Chat.String(), src.ID)
 	} else {
 		const q = `
-			SELECT target_platform, target_chat, target_message_id
+			SELECT target_platform, target_chat, target_message_id, has_media
 			FROM message_links
 			WHERE source_message_id = ?
 		`
@@ -109,16 +111,18 @@ func (s *SQLiteStore) LookupTargets(ctx context.Context, src domain.MessageRef) 
 	var links []domain.MessageLink
 	for rows.Next() {
 		var tgtPlatform, tgtChatRaw, tgtMessageID string
-		if err := rows.Scan(&tgtPlatform, &tgtChatRaw, &tgtMessageID); err != nil {
+		var hasMedia bool
+		if err := rows.Scan(&tgtPlatform, &tgtChatRaw, &tgtMessageID, &hasMedia); err != nil { // <--- ДОБАВЛЕНО
 			return nil, fmt.Errorf("scan target: %w", err)
 		}
 		tgtChat, err := domain.ParseChatID(tgtChatRaw)
 		if err != nil {
-			continue // Пропускаем битые записи
+			continue
 		}
 		links = append(links, domain.MessageLink{
-			Source: src,
-			Target: domain.MessageRef{Chat: tgtChat, ID: tgtMessageID},
+			Source:   src,
+			Target:   domain.MessageRef{Chat: tgtChat, ID: tgtMessageID},
+			HasMedia: hasMedia, // <--- ДОБАВЛЕНО
 		})
 	}
 	return links, nil
@@ -126,15 +130,16 @@ func (s *SQLiteStore) LookupTargets(ctx context.Context, src domain.MessageRef) 
 
 func (s *SQLiteStore) LookupSource(ctx context.Context, tgt domain.MessageRef) (*domain.MessageLink, error) {
 	const q = `
-		SELECT source_platform, source_chat, source_message_id
+		SELECT source_platform, source_chat, source_message_id, has_media
 		FROM message_links
 		WHERE target_platform = ? AND target_chat = ? AND target_message_id = ?
 		LIMIT 1
 	`
 	var srcPlatform, srcChatRaw, srcMessageID string
+	var hasMedia bool
 	err := s.db.QueryRowContext(ctx, q,
 		string(tgt.Chat.Platform()), tgt.Chat.String(), tgt.ID,
-	).Scan(&srcPlatform, &srcChatRaw, &srcMessageID)
+	).Scan(&srcPlatform, &srcChatRaw, &srcMessageID, &hasMedia) // <--- ДОБАВЛЕНО
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, domain.ErrNotFound
@@ -148,9 +153,69 @@ func (s *SQLiteStore) LookupSource(ctx context.Context, tgt domain.MessageRef) (
 		return nil, fmt.Errorf("parse source chat %q: %w", srcChatRaw, err)
 	}
 	return &domain.MessageLink{
-		Source: domain.MessageRef{Chat: srcChat, ID: srcMessageID},
-		Target: tgt,
+		Source:   domain.MessageRef{Chat: srcChat, ID: srcMessageID},
+		Target:   tgt,
+		HasMedia: hasMedia, // <--- ДОБАВЛЕНО
 	}, nil
+}
+
+func (s *SQLiteStore) DeleteLink(ctx context.Context, link domain.MessageLink) error {
+	const q = `
+		DELETE FROM message_links
+		WHERE source_platform = ? AND source_chat = ? AND source_message_id = ?
+		  AND target_platform = ? AND target_chat = ?
+	`
+	_, err := s.db.ExecContext(ctx, q,
+		string(link.Source.Chat.Platform()), link.Source.Chat.String(), link.Source.ID,
+		string(link.Target.Chat.Platform()), link.Target.Chat.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("delete link: %w", err)
+	}
+	return nil
+}
+
+// MoveLink атомарно заменяет старую связь на новую в одной транзакции.
+func (s *SQLiteStore) MoveLink(ctx context.Context, oldLink, newLink domain.MessageLink) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Удаляем старую связь
+	_, err = tx.ExecContext(ctx, `
+		DELETE FROM message_links
+		WHERE source_platform = ? AND source_chat = ? AND source_message_id = ?
+		  AND target_platform = ? AND target_chat = ?
+	`,
+		string(oldLink.Source.Chat.Platform()), oldLink.Source.Chat.String(), oldLink.Source.ID,
+		string(oldLink.Target.Chat.Platform()), oldLink.Target.Chat.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("delete old link: %w", err)
+	}
+
+	// 2. Вставляем новую
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO message_links (
+			source_platform, source_chat, source_message_id,
+			target_platform, target_chat, target_message_id, has_media
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(source_platform, source_chat, source_message_id, target_platform, target_chat)
+		DO UPDATE SET 
+			target_message_id = excluded.target_message_id,
+			has_media = excluded.has_media
+	`,
+		string(newLink.Source.Chat.Platform()), newLink.Source.Chat.String(), newLink.Source.ID,
+		string(newLink.Target.Chat.Platform()), newLink.Target.Chat.String(), newLink.Target.ID,
+		newLink.HasMedia,
+	)
+	if err != nil {
+		return fmt.Errorf("insert new link: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) Close() error {

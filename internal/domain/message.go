@@ -48,16 +48,17 @@ const (
 
 // Message — универсальное сообщение моста.
 type Message struct {
-	Ref         MessageRef
-	Action      MessageAction // <--- Добавили
-	AdapterName string
-	SenderID    string
-	SenderName  string
-	Text        string
-	Attachments []Attachment
-	ReplyTo     *MessageRef
-	Timestamp   time.Time
-	Meta        map[string]any
+	Ref          MessageRef
+	Action       MessageAction // <--- Добавили
+	MediaRemoved bool          // <-- true, если вложения были удалены
+	AdapterName  string
+	SenderID     string
+	SenderName   string
+	Text         string
+	Attachments  []Attachment
+	ReplyTo      *MessageRef
+	Timestamp    time.Time
+	Meta         map[string]any
 }
 
 // HasAttachments возвращает true, если есть вложения.

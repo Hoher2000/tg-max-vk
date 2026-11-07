@@ -8,7 +8,6 @@ import (
 
 	"github.com/Hoher2000/tg-max-vk/internal/domain"
 	"github.com/Hoher2000/tg-max-vk/internal/ratelimit"
-	"github.com/gotd/td/tgerr"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -103,6 +102,8 @@ func (r *Router) handle(ctx context.Context, msg *domain.Message) {
 				"chat", msg.Ref.Chat.String(),
 				"msg_id", msg.Ref.ID,
 				"action", action,
+				"text", msg.Text,
+				"attachments", msg.Attachments,
 			)
 			matched = true
 		}
@@ -168,100 +169,112 @@ func (r *Router) handleEdit(ctx context.Context, msg *domain.Message, route Rout
 		if fetcher, ok := r.adapters[msg.AdapterName].(domain.MediaFetcher); ok {
 			if err := fetcher.FetchMedia(ctx, msg); err != nil {
 				r.log.Error("failed to fetch pending media for edit", "err", err)
-				msg.Attachments = nil // Отправляем хотя бы текст
+				msg.Attachments = nil
 			}
 		}
 	}
 
 	links, err := r.store.LookupTargets(ctx, msg.Ref)
 	if err != nil {
-		r.log.Error("failed to lookup targets for edit", "err", err)
 		return
 	}
 
-	// Если сообщение — это ЦЕЛЬ (target), обновляем ИСТОЧНИК (source)
+	// Если это было целью, обновляем оригинал (Source)
 	if len(links) == 0 {
 		srcLink, err := r.store.LookupSource(ctx, msg.Ref)
 		if err == nil && srcLink != nil {
 			sourceAdapter, _ := r.findTargetAdapter(route, srcLink.Source.Chat)
 			if sourceAdapter != nil {
-				r.processEditForTarget(ctx, sourceAdapter, srcLink.Source, msg)
+				r.processEditForTarget(ctx, sourceAdapter, srcLink.Source, msg, *srcLink)
 			}
 		}
 		return
 	}
 
-	// Если сообщение — ИСТОЧНИК (source), обновляем все ЦЕЛИ (targets)
+	// Если это был источник, обновляем цели (Target)
 	for _, link := range links {
 		targetAdapter, _ := r.findTargetAdapter(route, link.Target.Chat)
-		if targetAdapter == nil {
-			continue
+		if targetAdapter != nil {
+			r.processEditForTarget(ctx, targetAdapter, link.Target, msg, link)
 		}
-		r.processEditForTarget(ctx, targetAdapter, link.Target, msg)
 	}
 }
 
 // processEditForTarget применяет изменения к конкретному адаптеру и сообщению.
-func (r *Router) processEditForTarget(ctx context.Context, adapter domain.Adapter, targetRef domain.MessageRef, msg *domain.Message) {
-	// 1. Если есть вложения — пробуем EditMedia (обновление на месте)
-	if len(msg.Attachments) > 0 {
-		if mediaEditor, ok := adapter.(domain.MediaEditor); ok {
-			if err := mediaEditor.EditMedia(ctx, targetRef, msg); err != nil {
-				r.log.Error("failed to edit media in-place", "adapter", adapter.Name(), "err", err)
-			} else {
-				r.log.Info("message media edited", "chat", targetRef.Chat.String(), "msg_id", targetRef.ID)
-			}
-			return
-		}
-	}
+func (r *Router) processEditForTarget(ctx context.Context, adapter domain.Adapter, ref domain.MessageRef, msg *domain.Message, link domain.MessageLink) {
+	// 1. Если медиа явно УДАЛЕНО
+	if msg.MediaRemoved {
+		if link.HasMedia {
+			r.log.Info("media removed in source, recreating message", "msg_id", ref.ID)
 
-	// 2. Если вложений нет — обновляем текст
-	editor, ok := adapter.(domain.Editor)
-	if !ok {
-		r.log.Warn("adapter doesn't support edit", "adapter", adapter.Name())
-		return
-	}
-
-	err := editor.Edit(ctx, targetRef, msg.Text)
-	if err != nil {
-		// 3. Если текст не изменился, значит в источнике удалили картинку.
-		// Telegram не умеет удалять медиа, поэтому удаляем сообщение и шлем новое.
-		if tgerr.Is(err, "MESSAGE_NOT_MODIFIED") {
-			r.log.Info("media removed in source, recreating message", "msg_id", targetRef.ID)
-
-			// Удаляем старое сообщение
+			// 1. Удаляем старое — если упало, прерываемся, ничего не трогаем
 			if deleter, ok := adapter.(domain.Deleter); ok {
-				if err := deleter.Delete(ctx, targetRef); err != nil {
-					r.log.Warn("failed to delete old message before recreate", "err", err)
+				if err := deleter.Delete(ctx, ref); err != nil {
+					r.log.Error("failed to delete old message, aborting recreate", "adapter", adapter.Name(), "err", err)
+					return
 				}
 			}
 
-			// Отправляем новое (только текст)
-			out := r.prepareOutgoing(msg, Target{Adapter: adapter.Name(), Chat: targetRef.Chat})
+			// 2. Отправляем новое. Если Send упал — старая связь остаётся
+			// (она указывает на удалённое сообщение, но хотя бы не теряется).
+			out := r.prepareOutgoing(msg, Target{Adapter: adapter.Name(), Chat: ref.Chat})
 			newRef, sendErr := adapter.Send(ctx, out)
-
 			if sendErr != nil {
-				r.log.Error("failed to resend message after media removal", "err", sendErr)
+				r.log.Error("failed to resend after media removal, link is now stale; manual DB recovery needed",
+					"adapter", adapter.Name(), "err", sendErr)
 				return
 			}
 
-			// 4. ОБНОВЛЯЕМ БД! Записываем новый ID, чтобы следующие правки шли в него.
-			newLink := domain.MessageLink{
-				Source: msg.Ref,
-				Target: newRef,
-			}
-			if err := r.store.SaveLink(ctx, newLink); err != nil {
-				r.log.Error("failed to save new link after media removal", "err", err)
+			// 3. Атомарно обновляем связь
+			oldLink := link
+			if ref.Chat.Equal(link.Source.Chat) {
+				link.Source = newRef
 			} else {
-				r.log.Info("message recreated (media removed)", "chat", newRef.Chat.String(), "msg_id", newRef.ID)
+				link.Target = newRef
+			}
+			link.HasMedia = false
+
+			if err := r.store.MoveLink(ctx, oldLink, link); err != nil {
+				r.log.Error("CRITICAL: failed to update link after recreate; message may be orphaned",
+					"err", err)
+				return
+			}
+			r.log.Info("message recreated", "chat", newRef.Chat.String(), "msg_id", newRef.ID)
+		} else {
+			if editor, ok := adapter.(domain.Editor); ok {
+				out := r.prepareOutgoing(msg, Target{Adapter: adapter.Name(), Chat: ref.Chat})
+				_ = editor.Edit(ctx, ref, out.Text)
+			}
+		}
+		return
+	}
+
+	// 2. Если медиа ЕСТЬ (или добавилось новое)
+	if len(msg.Attachments) > 0 {
+		if mediaEditor, ok := adapter.(domain.MediaEditor); ok {
+			// Передаем копию сообщения с маркером
+			out := r.prepareOutgoing(msg, Target{Adapter: adapter.Name(), Chat: ref.Chat})
+			if err := mediaEditor.EditMedia(ctx, ref, out); err != nil {
+				r.log.Error("failed to edit media in-place", "adapter", adapter.Name(), "err", err)
+			} else {
+				r.log.Info("message media edited", "chat", ref.Chat.String(), "msg_id", ref.ID)
+				link.HasMedia = true
+				if err := r.store.SaveLink(ctx, link); err != nil {
+					r.log.Error("failed to save link after edit", "err", err)
+				}
 			}
 			return
 		}
+	}
 
-		// Если это какая-то другая ошибка
-		r.log.Error("failed to edit message", "adapter", adapter.Name(), "err", err)
-	} else {
-		r.log.Info("message edited", "chat", targetRef.Chat.String(), "msg_id", targetRef.ID)
+	// 3. Просто обновление текста (с маркером ZWSP)
+	if editor, ok := adapter.(domain.Editor); ok {
+		out := r.prepareOutgoing(msg, Target{Adapter: adapter.Name(), Chat: ref.Chat})
+		if err := editor.Edit(ctx, ref, out.Text); err != nil {
+			r.log.Error("failed to edit message", "adapter", adapter.Name(), "err", err)
+		} else {
+			r.log.Info("message edited", "chat", ref.Chat.String(), "msg_id", ref.ID)
+		}
 	}
 }
 
@@ -435,8 +448,9 @@ func (r *Router) prepareOutgoing(msg *domain.Message, target Target) *domain.Mes
 // saveLinkAndLog сохраняет маппинг source → target и логирует.
 func (r *Router) saveLinkAndLog(ctx context.Context, msg *domain.Message, targetRef domain.MessageRef, route Route, target Target) error {
 	link := domain.MessageLink{
-		Source: msg.Ref,
-		Target: targetRef,
+		Source:   msg.Ref,
+		Target:   targetRef,
+		HasMedia: len(msg.Attachments) > 0,
 	}
 	if err := r.store.SaveLink(ctx, link); err != nil {
 		return fmt.Errorf("save link: %w", err)

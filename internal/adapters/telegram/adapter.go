@@ -17,14 +17,12 @@ import (
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/message/styling"
 	"github.com/gotd/td/telegram/message/unpack"
-	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 
 	_ "image/gif" // регистрируем декодер GIF
 	"image/jpeg"
-	_ "image/jpeg" // регистрируем декодер JPEG
-	_ "image/png"  // регистрируем декодер PNG
+	_ "image/png" // регистрируем декодер PNG
 
 	// Если нужно поддерживать WebP, придется добавить зависимость
 	"github.com/Hoher2000/tg-max-vk/internal/domain"
@@ -123,7 +121,6 @@ func (a *Adapter) Start(ctx context.Context, out chan<- *domain.Message) error {
 			}
 
 			a.api = a.client.API()
-			a.peersMgr = peers.Options{}.Build(a.api)
 			a.sender = message.NewSender(a.api)
 			close(a.ready)
 			a.log.Info("telegram adapter ready",
@@ -328,11 +325,16 @@ func (a *Adapter) Send(ctx context.Context, msg *domain.Message) (domain.Message
 	if err != nil {
 		return domain.MessageRef{}, err
 	}
+
 	upd, err := a.sendWithMedia(ctx, peer, msg)
-	if err != nil {
-		return domain.MessageRef{}, fmt.Errorf("telegram send: %w", err)
+	id, unpackErr := unpack.MessageID(upd, err) // Передаем err как второй аргумент!
+	if unpackErr != nil {
+		return domain.MessageRef{}, fmt.Errorf("telegram send: %w", unpackErr)
 	}
-	id, err := unpack.MessageID(upd, nil)
+	if id == 0 {
+		return domain.MessageRef{}, fmt.Errorf("telegram send: extracted message ID is 0")
+	}
+
 	return domain.MessageRef{Chat: msg.Ref.Chat, ID: strconv.Itoa(id)}, nil
 }
 
@@ -342,12 +344,17 @@ func (a *Adapter) Reply(ctx context.Context, to domain.MessageRef, msg *domain.M
 	if err != nil {
 		return domain.MessageRef{}, err
 	}
-	replyTo, _ := strconv.Atoi(to.ID)
-	upd, err := a.sendWithMedia(ctx, peer, msg, replyTo)
+	replyTo, err := strconv.Atoi(to.ID)
 	if err != nil {
-		return domain.MessageRef{}, fmt.Errorf("telegram reply: %w", err)
+		return domain.MessageRef{}, fmt.Errorf("invalid reply target id %q: %w", to.ID, err)
 	}
-	id, err := unpack.MessageID(upd, nil)
+
+	upd, err := a.sendWithMedia(ctx, peer, msg, replyTo)
+	id, unpackErr := unpack.MessageID(upd, err)
+	if unpackErr != nil {
+		return domain.MessageRef{}, fmt.Errorf("telegram reply: %w", unpackErr)
+	}
+
 	return domain.MessageRef{Chat: msg.Ref.Chat, ID: strconv.Itoa(id)}, nil
 }
 
@@ -395,9 +402,13 @@ func (a *Adapter) sendWithMedia(ctx context.Context, peer tg.InputPeerClass, msg
 			if err != nil {
 				return nil, fmt.Errorf("upload raw bytes: %w", err)
 			}
+			mimeType := att.MimeType
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
 			doc := message.UploadedDocument(tgFile, styling.Plain(msg.Text)).
 				Filename(att.FileName).
-				MIME("image/webp")
+				MIME(mimeType)
 			return builder.Media(ctx, doc)
 		}
 
@@ -532,7 +543,49 @@ func (a *Adapter) resolveInputPeer(ctx context.Context, chat domain.ChatID) (tg.
 		hash, ok := a.channels[channelID]
 		a.channelsMu.RUnlock()
 		if !ok {
-			return nil, fmt.Errorf("no access_hash for channel %d; wait for an update or use @username", channelID)
+			a.log.Info("access_hash not cached, resolving via getDialogs", "channel_id", channelID)
+
+			// Запрашиваем диалоги (это вернет все каналы, где ты состоишь)
+			res, err := a.api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+				Limit:      100, // можно увеличить, если каналов много
+				OffsetPeer: &tg.InputPeerEmpty{},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("get dialogs to resolve channel %d: %w", channelID, err)
+			}
+
+			// Извлекаем список чатов через type switch
+			var chats []tg.ChatClass
+			switch v := res.(type) {
+			case *tg.MessagesDialogs:
+				chats = v.Chats
+			case *tg.MessagesDialogsSlice:
+				chats = v.Chats
+			case *tg.MessagesDialogsNotModified:
+				return nil, fmt.Errorf("dialogs not modified, cannot resolve channel %d", channelID)
+			default:
+				return nil, fmt.Errorf("unexpected dialogs type: %T", res)
+			}
+
+			var foundHash int64
+			// Ищем нужный канал в списке чатов
+			for _, chat := range chats {
+				if ch, ok := chat.(*tg.Channel); ok && ch.ID == channelID {
+					foundHash = ch.AccessHash
+					break
+				}
+			}
+
+			if foundHash == 0 {
+				return nil, fmt.Errorf("channel %d not found in dialogs; try using @username", channelID)
+			}
+
+			// Кэшируем найденный хеш
+			a.channelsMu.Lock()
+			a.channels[channelID] = foundHash
+			a.channelsMu.Unlock()
+
+			return &tg.InputPeerChannel{ChannelID: channelID, AccessHash: foundHash}, nil
 		}
 		return &tg.InputPeerChannel{ChannelID: channelID, AccessHash: hash}, nil
 
@@ -747,10 +800,18 @@ func (a *Adapter) handleEditMsg(ctx context.Context, msg *tg.Message, out chan<-
 		Meta:        make(map[string]any),
 	}
 
-	// ВАЖНО: не скачиваем медиа здесь!
-	// Просто ставим заглушку, чтобы роутер знал, что оно есть.
+	// Проверяем, есть ли реальное медиа
+	hasMedia := false
 	if msg.Media != nil {
+		if _, isEmpty := msg.Media.(*tg.MessageMediaEmpty); !isEmpty {
+			hasMedia = true
+		}
+	}
+
+	if hasMedia {
 		coreMsg.Attachments = []domain.Attachment{{Type: "pending"}}
+	} else {
+		coreMsg.MediaRemoved = true
 	}
 
 	select {
@@ -823,21 +884,36 @@ func (a *Adapter) EditMedia(ctx context.Context, ref domain.MessageRef, msg *dom
 		if err != nil {
 			return fmt.Errorf("read image: %w", err)
 		}
-		img, _, err := image.Decode(bytes.NewReader(imgData))
-		if err != nil {
-			return fmt.Errorf("decode image: %w", err)
+
+		// Пытаемся декодировать
+		img, _, decodeErr := image.Decode(bytes.NewReader(imgData))
+		if decodeErr != nil {
+			// ФОЛБЭК: если не смогли декодировать, отправляем как файл
+			a.log.Warn("cannot decode image for edit, sending as document", "err", decodeErr)
+			tgFile, err := up.FromBytes(ctx, att.FileName, imgData)
+			if err != nil {
+				return fmt.Errorf("upload raw bytes: %w", err)
+			}
+			mimeType := att.MimeType
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
+			doc := message.UploadedDocument(tgFile, styling.Plain(msg.Text)).
+				Filename(att.FileName).
+				MIME(mimeType)
+			_, err = builder.Media(ctx, doc)
+			return err
 		}
+
 		var buf bytes.Buffer
 		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90}); err != nil {
 			return fmt.Errorf("encode jpeg: %w", err)
 		}
-
 		tgFile, err := up.FromBytes(ctx, "photo.jpg", buf.Bytes())
 		if err != nil {
 			return fmt.Errorf("upload photo: %w", err)
 		}
 
-		// Отправляем на редактирование как фото
 		_, err = builder.Media(ctx, message.UploadedPhoto(tgFile, styling.Plain(msg.Text)))
 		return err
 	}

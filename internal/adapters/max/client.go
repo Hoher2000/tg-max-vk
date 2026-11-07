@@ -297,7 +297,7 @@ func (c *Client) uploadMedia(ctx context.Context, att domain.Attachment, r io.Re
 	return "", fmt.Errorf("token not found in upload response. body: %s", string(bodyBytes))
 }
 
-func (c *Client) editMessageWithAttachments(ctx context.Context, messageID string, text string, attachments []Attachment) error {
+func (c *Client) editMessageWithAttachments(ctx context.Context, messageID string, text string, attachments *[]Attachment) error {
 	endpoint := fmt.Sprintf("%s/messages?message_id=%s", c.baseURL, messageID)
 
 	body := SendMessageRequest{
@@ -319,9 +319,18 @@ func (c *Client) editMessageWithAttachments(ctx context.Context, messageID strin
 	}
 	defer resp.Body.Close()
 
+	bodyBytes, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("max edit media failed %d: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("max edit media failed %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	// Проверяем success в теле (аналогично editMessage/deleteMessage)
+	if len(bodyBytes) > 0 {
+		var apiResp SuccessResponse
+		if err := json.Unmarshal(bodyBytes, &apiResp); err == nil && !apiResp.Success {
+			return fmt.Errorf("max edit media returned success=false: %s", string(bodyBytes))
+		}
 	}
 	return nil
 }
@@ -369,12 +378,18 @@ func (c *Client) deleteMessage(ctx context.Context, messageID string) error {
 	}
 	defer resp.Body.Close()
 
-	var apiResp SuccessResponse
 	bodyBytes, _ := io.ReadAll(resp.Body)
-	_ = json.Unmarshal(bodyBytes, &apiResp)
 
-	if resp.StatusCode != http.StatusOK || !apiResp.Success {
-		return fmt.Errorf("max edit failed %d: %s", resp.StatusCode, string(bodyBytes))
+	// Если ответ пустой, но статус 200 или 204 — это успех
+	if len(bodyBytes) > 0 {
+		var apiResp SuccessResponse
+		_ = json.Unmarshal(bodyBytes, &apiResp)
+		if !apiResp.Success {
+			return fmt.Errorf("max delete failed: success=false, body: %s", string(bodyBytes))
+		}
+	} else if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("max delete failed with status %d", resp.StatusCode)
 	}
+
 	return nil
 }

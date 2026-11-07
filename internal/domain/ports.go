@@ -45,16 +45,11 @@ type Deleter interface {
 
 // Store — персистентность.
 type Store interface {
-	// SaveLink сохраняет связь source → target.
 	SaveLink(ctx context.Context, link MessageLink) error
-
-	// LookupTargets возвращает все цели, куда было переслано сообщение.
+	DeleteLink(ctx context.Context, link MessageLink) error
+	MoveLink(ctx context.Context, oldLink, newLink MessageLink) error // <-- новый
 	LookupTargets(ctx context.Context, src MessageRef) ([]MessageLink, error)
-
-	// LookupSource возвращает источник по цели (для обратной трансляции).
 	LookupSource(ctx context.Context, tgt MessageRef) (*MessageLink, error)
-
-	// Close закрывает хранилище.
 	Close() error
 }
 

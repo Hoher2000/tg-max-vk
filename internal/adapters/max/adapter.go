@@ -207,41 +207,42 @@ func (a *Adapter) convertUpdate(u Update) *domain.Message {
 	}
 
 	out := &domain.Message{
-		Ref: domain.MessageRef{
-			Chat: chat,
-			ID:   msg.Body.Mid,
-		},
-		Action:      action, // <--- Теперь тут правильный Action
+		Ref:         domain.MessageRef{Chat: chat, ID: msg.Body.Mid},
+		Action:      action,
 		AdapterName: a.name,
 		Text:        msg.Body.Text,
 		Timestamp:   time.UnixMilli(msg.Timestamp),
 		Meta:        make(map[string]any),
 	}
 
-	// Парсим вложения
-	for _, att := range msg.Body.Attachments {
-		attType := domain.AttachmentDocument
-		if att.Type == "image" {
-			attType = domain.AttachmentPhoto
-		} else if att.Type == "video" {
-			attType = domain.AttachmentVideo
-		}
+	if len(msg.Body.Attachments) > 0 { // Парсим вложения
+		for _, att := range msg.Body.Attachments {
+			attType := domain.AttachmentDocument
+			switch att.Type {
+			case "image":
+				attType = domain.AttachmentPhoto
+			case "video":
+				attType = domain.AttachmentVideo
+			}
 
-		var fileURL string
-		if payloadMap, ok := att.Payload.(map[string]any); ok {
-			if u, ok := payloadMap["url"].(string); ok {
-				fileURL = u
+			var fileURL string
+			if payloadMap, ok := att.Payload.(map[string]any); ok {
+				if u, ok := payloadMap["url"].(string); ok {
+					fileURL = u
+				}
+			}
+
+			if fileURL != "" {
+				out.Attachments = append(out.Attachments, domain.Attachment{
+					Type: attType,
+					URL:  fileURL,
+				})
+			} else {
+				a.log.Debug("attachment without URL", "type", att.Type)
 			}
 		}
-
-		if fileURL != "" {
-			out.Attachments = append(out.Attachments, domain.Attachment{
-				Type: attType,
-				URL:  fileURL,
-			})
-		} else {
-			a.log.Debug("attachment without URL", "type", att.Type)
-		}
+	} else {
+		out.MediaRemoved = true
 	}
 
 	if msg.Sender != nil {
@@ -338,7 +339,7 @@ func parseTargetChat(chat domain.ChatID) (chatID, userID int64, err error) {
 }
 
 // prepareAttachments загружает файлы в MAX и возвращает готовые объекты для API
-func (a *Adapter) prepareAttachments(ctx context.Context, msg *domain.Message) []Attachment {
+func (a *Adapter) prepareAttachments(ctx context.Context, msg *domain.Message) *[]Attachment {
 	var attachments []Attachment
 	for _, att := range msg.Attachments {
 		if att.MediaKey == "" {
@@ -371,41 +372,45 @@ func (a *Adapter) prepareAttachments(ctx context.Context, msg *domain.Message) [
 			Payload: map[string]any{"token": token},
 		})
 	}
-	return attachments
+	return &attachments
 }
 
 func (a *Adapter) EditMedia(ctx context.Context, ref domain.MessageRef, msg *domain.Message) error {
-	// 1. Загружаем новое вложение
-	var newAttachments []Attachment
-	for _, att := range msg.Attachments {
-		file, err := a.media.Open(ctx, att.MediaKey)
-		if err != nil {
-			a.log.Error("failed to open media", "key", att.MediaKey, "err", err)
-			continue
+	var atts []Attachment
+
+	if !msg.MediaRemoved {
+		for _, att := range msg.Attachments {
+			file, err := a.media.Open(ctx, att.MediaKey)
+			if err != nil {
+				return fmt.Errorf("open media %q: %w", att.MediaKey, err)
+			}
+
+			token, err := a.client.uploadMedia(ctx, att, file)
+			file.Close()
+			if err != nil {
+				return fmt.Errorf("upload media to max: %w", err)
+			}
+
+			attType := "image"
+			switch att.Type {
+			case domain.AttachmentVideo:
+				attType = "video"
+			case domain.AttachmentDocument:
+				attType = "file"
+			}
+
+			atts = append(atts, Attachment{
+				Type:    attType,
+				Payload: map[string]any{"token": token},
+			})
 		}
 
-		token, err := a.client.uploadMedia(ctx, att, file)
-		file.Close()
-		if err != nil {
-			a.log.Error("failed to upload media to max", "err", err)
-			continue
+		if len(msg.Attachments) > 0 && len(atts) == 0 {
+			return fmt.Errorf("all attachments failed to upload")
 		}
-
-		attType := "image"
-		if att.Type == domain.AttachmentVideo {
-			attType = "video"
-		} else if att.Type == domain.AttachmentDocument {
-			attType = "file"
-		}
-
-		newAttachments = append(newAttachments, Attachment{
-			Type:    attType,
-			Payload: map[string]any{"token": token},
-		})
 	}
 
-	// 2. Отправляем запрос на редактирование с новыми вложениями
-	return a.client.editMessageWithAttachments(ctx, ref.ID, msg.Text, newAttachments)
+	return a.client.editMessageWithAttachments(ctx, ref.ID, msg.Text, &atts)
 }
 
 func (a *Adapter) Edit(ctx context.Context, ref domain.MessageRef, newText string) error {

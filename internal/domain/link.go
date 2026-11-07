@@ -7,5 +7,6 @@ import "time"
 type MessageLink struct {
 	Source    MessageRef
 	Target    MessageRef
+	HasMedia  bool // <--- Новое поле
 	CreatedAt time.Time
 }

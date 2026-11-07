@@ -76,8 +76,8 @@ type Attachment struct {
 // SendMessageRequest — тело POST /messages.
 type SendMessageRequest struct {
 	Text        string         `json:"text,omitempty"`
-	Attachments []Attachment   `json:"attachments,omitempty"`
-	Link        *LinkedMessage `json:"link,omitempty"` // для reply
+	Attachments *[]Attachment  `json:"attachments,omitempty"` // <-- Делаем указателем!
+	Link        *LinkedMessage `json:"link,omitempty"`
 }
 
 // SendMessageResponse — ответ на отправку.
